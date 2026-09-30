@@ -1,0 +1,20 @@
+services:
+  lido-keys-exporter:
+    build: .
+    image: ${LKE_IMAGE:-lido-keys-exporter}:${LKE_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      LKE_EXECUTION_ENDPOINTS: ${LKE_EXECUTION_ENDPOINTS:-}
+      LKE_BEACON_ENDPOINTS: ${LKE_BEACON_ENDPOINTS:-}
+      LKE_LOG_LEVEL: ${LKE_LOG_LEVEL:-}
+    volumes:
+      - ./config.yaml:/opt/app/config.yaml:ro
+      - lke-data:/opt/app/data
+    ports:
+      - "${LKE_PORT:-9800}:9800"
+
+volumes:
+  lke-data:

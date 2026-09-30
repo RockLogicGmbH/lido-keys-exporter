@@ -1,0 +1,17 @@
+.venv
+.git
+.github
+.gitignore
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+tests
+dist
+data
+grafana
+prometheus
+config.yaml
+.env
+docker-compose*.yml
