@@ -1,0 +1,77 @@
+# lido-keys-exporter configuration. Copy to config.yaml and adjust.
+# Environment overrides: LKE_EXECUTION_ENDPOINTS, LKE_BEACON_ENDPOINTS (comma separated),
+# LKE_LISTEN, LKE_DATA_DIR, LKE_LOG_LEVEL.
+
+# Only mainnet is supported.
+network: mainnet
+
+# Address of the Prometheus metrics endpoint (host:port).
+listen: "0.0.0.0:9800"
+
+# Directory for the SQLite state (state.sqlite3). Mounted as a volume in Docker.
+data_dir: /opt/app/data
+
+# Own execution layer JSON-RPC endpoints, tried in order. Unsynced endpoints are skipped.
+execution_endpoints:
+  - http://execution-1:8545
+  # - http://execution-2:8545
+
+# Own beacon node HTTP API endpoints, tried in order. Only the head state is ever queried.
+beacon_endpoints:
+  - http://beacon-1:5052
+  # - http://beacon-2:5052
+
+# Blocks behind head that are considered safe to process.
+confirmations: 2
+
+# How often the key set is reloaded from the Keys API.
+keyset_refresh_minutes: 10
+
+# Lookback on first start (and maximum gap after a restart), in days.
+exit_lookback_days: 14
+deposit_lookback_days: 7
+triggered_lookback_days: 7
+
+# Block range per eth_getLogs request (halved automatically if a node rejects the range).
+log_chunk_blocks: 2000
+
+# Seconds between iterations of the main loop.
+poll_interval_seconds: 12
+
+# Blocks rewound when a reorg is detected below a stored cursor.
+reorg_rewind_blocks: 64
+
+# Timeout for every HTTP request to EL, beacon and Keys API.
+http_timeout_seconds: 30
+
+# Expected withdrawal credentials of deposits: the 20 byte vault address or the full
+# 32 byte credentials (0x01 or 0x02 type accepted, only the address part is compared).
+# Resolved from the LidoLocator withdrawalVault() when unset.
+expected_withdrawal_credentials: null
+
+# Look up keys without a deposit in the lookback window on the beacon chain (head state)
+# so a later deposit to an already active validator is counted as a top-up.
+seed_deposited_from_beacon: true
+
+# Key sets. Every set can combine Keys API sources and static pubkeys.
+sets:
+  - name: main
+    keys_api:
+      # Replace with your staking module ID and node operator ID.
+      - url: http://keys-api:3000
+        module_id: 1
+        operator_id: 0
+    static_pubkeys: []
+    # static_pubkeys:
+    #   - pubkey: "0x<96 hex characters>"
+    #     label: my-validator
+
+# Names for EIP-7002 withdrawal request source addresses (used as the "source" label).
+# The Lido withdrawal vault is labelled "lido-withdrawal-vault" automatically, other
+# unknown sources are labelled with their address. Names starting with "lido" are treated
+# as expected sources by the Grafana alert "triggered withdrawal from unexpected source".
+known_sources: {}
+# known_sources:
+#   "0x0000000000000000000000000000000000000000": lido-triggerable-withdrawals-gateway
+
+log_level: INFO
