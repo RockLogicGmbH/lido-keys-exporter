@@ -9,6 +9,7 @@ from eth_abi import encode as abi_encode
 
 from src.clients.cl import CLError, NonHeadStateError
 from src.clients.el import BlockHeader, ELError, ELRpcError
+from src.clients.health import EndpointState
 from src.contracts import (
     DEPOSIT_CONTRACT,
     DEPOSIT_EVENT_TOPIC,
@@ -162,6 +163,13 @@ class FakeExecutionClient:
     def refresh_health(self) -> bool:
         return self.healthy
 
+    def endpoint_states(self) -> list[EndpointState]:
+        return [
+            EndpointState(
+                kind="el", endpoint="el:8545", url="http://el:8545", up=self.healthy, head=self.chain.head, lag=0
+            )
+        ]
+
     def block_number(self) -> int:
         self._check()
         return self.chain.head
@@ -243,6 +251,9 @@ class FakeBeaconClient:
     def refresh_health(self) -> bool:
         self._request("/eth/v1/node/syncing")
         return self.healthy
+
+    def endpoint_states(self) -> list[EndpointState]:
+        return [EndpointState(kind="cl", endpoint="cl:5052", url="http://cl:5052", up=self.healthy, head=self.slot, lag=0)]
 
     def head_slot(self) -> int:
         self._request("/eth/v1/beacon/headers/head")

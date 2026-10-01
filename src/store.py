@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS deposits (
     PRIMARY KEY (tx_hash, log_index)
 );
 CREATE INDEX IF NOT EXISTS deposits_pubkey ON deposits (pubkey);
+CREATE INDEX IF NOT EXISTS deposits_timestamp ON deposits (block_timestamp);
 CREATE TABLE IF NOT EXISTS validators (
     pubkey TEXT PRIMARY KEY,
     validator_index INTEGER,
@@ -72,9 +73,11 @@ CREATE TABLE IF NOT EXISTS exit_requests (
     status TEXT NOT NULL DEFAULT 'open',
     closed_status TEXT,
     closed_at INTEGER,
+    checked_at INTEGER,
     PRIMARY KEY (tx_hash, log_index)
 );
 CREATE INDEX IF NOT EXISTS exit_requests_status ON exit_requests (status, pubkey);
+CREATE INDEX IF NOT EXISTS exit_requests_timestamp ON exit_requests (block_timestamp);
 CREATE TABLE IF NOT EXISTS triggered (
     tx_hash TEXT NOT NULL,
     log_index INTEGER NOT NULL,
@@ -88,6 +91,12 @@ CREATE TABLE IF NOT EXISTS triggered (
     block_timestamp INTEGER NOT NULL,
     slot INTEGER NOT NULL,
     PRIMARY KEY (tx_hash, log_index)
+);
+CREATE INDEX IF NOT EXISTS triggered_timestamp ON triggered (block_timestamp);
+CREATE TABLE IF NOT EXISTS counter_offsets (
+    series TEXT PRIMARY KEY,
+    last REAL NOT NULL,
+    offset REAL NOT NULL
 );
 """
 
@@ -134,6 +143,7 @@ class ExitRequestRecord:
     status: str = "open"
     closed_status: Optional[str] = None
     closed_at: Optional[int] = None
+    checked_at: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -159,13 +169,22 @@ class ValidatorInfo:
 
 
 @dataclass(frozen=True)
-class DepositSummary:
+class DepositDetails:
+    """Initial deposit (None if only top-ups were seen) plus top-up totals of one key."""
+
     pubkey: str
-    initial_block: int
-    initial_timestamp: int
-    credentials_type: str
+    initial_block: Optional[int]
+    initial_timestamp: Optional[int]
+    initial_gwei: Optional[int]
+    credentials_type: Optional[str]
     mismatch: bool
+    topups: int
+    topup_gwei: int
+    last_topup_timestamp: Optional[int]
     deposits: int
+
+
+DepositSummary = DepositDetails
 
 
 def _chunks(items: list[str], size: int = IN_CHUNK) -> Iterator[list[str]]:
@@ -189,6 +208,11 @@ class Store:
         for statement in SCHEMA.split(";"):
             if statement.strip():
                 self._conn.execute(statement)
+        columns = {r[1] for r in self._conn.execute("PRAGMA table_info(exit_requests)")}
+        if "checked_at" not in columns:
+            self._conn.execute("ALTER TABLE exit_requests ADD COLUMN checked_at INTEGER")
+        # Top-ups ignore credentials on the beacon chain; 0.1.0 flagged them too.
+        self._conn.execute("UPDATE deposits SET mismatch = 0 WHERE is_topup = 1 AND mismatch = 1")
         if self._conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 0:
             self._conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
         self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -298,7 +322,7 @@ class Store:
                 rec.amount_gwei,
                 rec.withdrawal_credentials,
                 rec.credentials_type,
-                int(rec.mismatch),
+                int(rec.mismatch and not rec.is_topup),
                 int(rec.is_topup),
                 rec.block_number,
                 rec.block_hash,
@@ -315,25 +339,47 @@ class Store:
         )
         return bool(rows)
 
-    def deposit_summary(self) -> dict[str, DepositSummary]:
+    def deposit_summary(self) -> dict[str, DepositDetails]:
+        """Per pubkey with any deposit row: earliest non-topup deposit and top-up totals."""
         rows = self._query(
-            "SELECT pubkey, block_number, block_timestamp, credentials_type, mismatch, is_topup FROM deposits "
-            "ORDER BY pubkey, is_topup, block_number, log_index"
+            "SELECT pubkey, block_number, block_timestamp, amount_gwei, credentials_type, mismatch, is_topup "
+            "FROM deposits ORDER BY pubkey, block_number, log_index"
         )
-        result: dict[str, DepositSummary] = {}
-        for pubkey, number, ts, ctype, mismatch, _topup in rows:
-            prev = result.get(pubkey)
-            if prev is None:
-                result[pubkey] = DepositSummary(pubkey, number, ts, ctype, bool(mismatch), 1)
-            else:
-                result[pubkey] = DepositSummary(
-                    pubkey,
-                    prev.initial_block,
-                    prev.initial_timestamp,
-                    prev.credentials_type,
-                    prev.mismatch or bool(mismatch),
-                    prev.deposits + 1,
+        result: dict[str, DepositDetails] = {}
+        for pubkey, number, ts, amount, ctype, mismatch, topup in rows:
+            prev = result.get(pubkey) or DepositDetails(pubkey, None, None, None, None, False, 0, 0, None, 0)
+            if topup:
+                result[pubkey] = replace(
+                    prev,
+                    topups=prev.topups + 1,
+                    topup_gwei=prev.topup_gwei + amount,
+                    last_topup_timestamp=ts if prev.last_topup_timestamp is None else max(prev.last_topup_timestamp, ts),
+                    deposits=prev.deposits + 1,
                 )
+            elif prev.initial_block is None:
+                result[pubkey] = replace(
+                    prev,
+                    initial_block=number,
+                    initial_timestamp=ts,
+                    initial_gwei=amount,
+                    credentials_type=ctype,
+                    mismatch=bool(mismatch),
+                    deposits=prev.deposits + 1,
+                )
+            else:
+                result[pubkey] = replace(prev, deposits=prev.deposits + 1)
+        return result
+
+    def deposit_event_totals(self, since_timestamp: Optional[int] = None) -> dict[str, dict[str, tuple[int, int]]]:
+        """Pubkey -> kind ('initial'|'topup') -> (count, gwei), optionally only events at or after since."""
+        sql = "SELECT pubkey, is_topup, COUNT(*), SUM(amount_gwei) FROM deposits"
+        params: tuple = ()
+        if since_timestamp is not None:
+            sql += " WHERE block_timestamp >= ?"
+            params = (since_timestamp,)
+        result: dict[str, dict[str, tuple[int, int]]] = {}
+        for pubkey, topup, count, gwei in self._query(sql + " GROUP BY pubkey, is_topup", params):
+            result.setdefault(pubkey, {})["topup" if topup else "initial"] = (count, gwei or 0)
         return result
 
     def deposited_pubkeys(self) -> set[str]:
@@ -351,7 +397,7 @@ class Store:
     def mark_topups_after(self, pubkey: str, timestamp: int) -> int:
         """Reclassify deposits of pubkey made after timestamp as top-ups."""
         cur = self._execute(
-            "UPDATE deposits SET is_topup = 1 WHERE pubkey = ? AND is_topup = 0 AND block_timestamp > ?",
+            "UPDATE deposits SET is_topup = 1, mismatch = 0 WHERE pubkey = ? AND is_topup = 0 AND block_timestamp > ?",
             (pubkey, timestamp),
         )
         return cur.rowcount
@@ -384,7 +430,7 @@ class Store:
         cur = self._execute(
             "INSERT OR IGNORE INTO exit_requests (tx_hash, log_index, pubkey, set_name, origin, module_id, "
             "operator_id, validator_index, request_timestamp, block_number, block_hash, block_timestamp, status, "
-            "closed_status, closed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "closed_status, closed_at, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 rec.tx_hash,
                 rec.log_index,
@@ -401,17 +447,29 @@ class Store:
                 rec.status,
                 rec.closed_status,
                 rec.closed_at,
+                rec.checked_at,
             ),
         )
         return cur.rowcount == 1
 
-    def open_exit_requests(self) -> list[ExitRequestRecord]:
+    def open_exit_requests(self, checked_only: bool = False) -> list[ExitRequestRecord]:
+        """Open requests; checked_only skips those not yet compared with the beacon chain."""
+        where = "status = 'open'" + (" AND checked_at IS NOT NULL" if checked_only else "")
         rows = self._query(
             "SELECT pubkey, set_name, origin, module_id, operator_id, validator_index, request_timestamp, "
-            "block_number, block_hash, block_timestamp, tx_hash, log_index, status, closed_status, closed_at "
-            "FROM exit_requests WHERE status = 'open' ORDER BY block_number, log_index"
+            "block_number, block_hash, block_timestamp, tx_hash, log_index, status, closed_status, closed_at, "
+            f"checked_at FROM exit_requests WHERE {where} ORDER BY block_number, log_index"
         )
         return [ExitRequestRecord(*r) for r in rows]
+
+    def mark_exit_requests_checked(self, pubkeys: Iterable[str], checked_at: int) -> None:
+        keys = sorted(set(pubkeys))
+        with self._lock:
+            for chunk in _chunks(keys):
+                self._execute(
+                    f"UPDATE exit_requests SET checked_at = ? WHERE status = 'open' AND pubkey IN ({','.join('?' * len(chunk))})",
+                    [checked_at, *chunk],
+                )
 
     def close_exit_requests(self, pubkey: str, closed_status: str, closed_at: int) -> int:
         cur = self._execute(
@@ -423,6 +481,18 @@ class Store:
 
     def exit_request_count(self) -> int:
         return self._query("SELECT COUNT(*) FROM exit_requests")[0][0]
+
+    def exit_request_totals(
+        self, since_timestamp: Optional[int] = None
+    ) -> dict[tuple[str, str, Optional[int], Optional[int]], int]:
+        """(set_name, origin, module_id, operator_id) -> requests of any status, optionally since a block time."""
+        sql = "SELECT set_name, origin, module_id, operator_id, COUNT(*) FROM exit_requests"
+        params: tuple = ()
+        if since_timestamp is not None:
+            sql += " WHERE block_timestamp >= ?"
+            params = (since_timestamp,)
+        rows = self._query(sql + " GROUP BY set_name, origin, module_id, operator_id", params)
+        return {(s, o, m, op): n for s, o, m, op, n in rows}
 
     # Triggered withdrawals
 
@@ -446,9 +516,36 @@ class Store:
         )
         return cur.rowcount == 1
 
-    def triggered_last(self) -> dict[tuple[str, str], int]:
-        rows = self._query("SELECT pubkey, kind, MAX(block_timestamp) FROM triggered GROUP BY pubkey, kind")
-        return {(p, k): ts for p, k, ts in rows}
+    def triggered_last(self) -> dict[tuple[str, str, str], int]:
+        """(pubkey, kind, source_name) -> block time of the latest request."""
+        rows = self._query(
+            "SELECT pubkey, kind, source_name, MAX(block_timestamp) FROM triggered GROUP BY pubkey, kind, source_name"
+        )
+        return {(p, k, src): ts for p, k, src, ts in rows}
+
+    def triggered_totals(self, since_timestamp: Optional[int] = None) -> dict[tuple[str, str, str], tuple[int, int]]:
+        """(pubkey, kind, source_name) -> (count, gwei), optionally only requests at or after since."""
+        sql = "SELECT pubkey, kind, source_name, COUNT(*), SUM(amount_gwei) FROM triggered"
+        params: tuple = ()
+        if since_timestamp is not None:
+            sql += " WHERE block_timestamp >= ?"
+            params = (since_timestamp,)
+        rows = self._query(sql + " GROUP BY pubkey, kind, source_name", params)
+        return {(p, k, src): (n, gwei or 0) for p, k, src, n, gwei in rows}
+
+    # Counter offsets
+
+    def counter_offsets(self) -> dict[str, tuple[float, float]]:
+        """Series -> (last value read from the store, offset added to keep the exported counter monotonic)."""
+        return {k: (last, off) for k, last, off in self._query("SELECT series, last, offset FROM counter_offsets")}
+
+    def save_counter_offsets(self, offsets: dict[str, tuple[float, float]]) -> None:
+        with self.transaction():
+            self._conn.executemany(
+                "INSERT INTO counter_offsets (series, last, offset) VALUES (?, ?, ?) "
+                "ON CONFLICT(series) DO UPDATE SET last = excluded.last, offset = excluded.offset",
+                [(k, last, off) for k, (last, off) in offsets.items()],
+            )
 
     # Reorgs
 

@@ -21,6 +21,10 @@ beacon_endpoints:
   - http://beacon-1:5052
   # - http://beacon-2:5052
 
+# Blocks (execution) or slots (beacon) an endpoint may be behind the best endpoint of its
+# kind before it is treated as unhealthy and skipped.
+max_endpoint_lag: 5
+
 # Blocks behind head that are considered safe to process.
 confirmations: 2
 

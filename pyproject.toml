@@ -1,6 +1,6 @@
 [project]
 name = "lido-keys-exporter"
-version = "0.1.0"
+version = "0.1.1"
 description = "Prometheus exporter for deposits, Lido exit requests and EIP-7002 triggered withdrawals of a set of Lido validator keys"
 readme = "README.md"
 license = "MIT"

@@ -93,6 +93,9 @@ class Env:
     def safe(self) -> int:
         return self.chain.head - self.cfg.confirmations
 
+    def deposits(self, kind: str = "initial", **group: str) -> Optional[float]:
+        return self.value("lido_keys_deposit_events_total", **(group or GROUP), kind=kind)
+
 
 @pytest.fixture
 def env(tmp_path: Path) -> Env:
@@ -112,13 +115,15 @@ def test_initial_deposit(env: Env) -> None:
     env.chain.add_log(19_001, deposit_log(pubkey(99), WC))  # not ours
     env.tick()
 
-    assert env.value("lido_keys_deposits_total", **GROUP, credentials="0x01") == 1
-    assert env.value("lido_keys_topups_total", **GROUP) is None
+    assert env.deposits("initial") == 1
+    assert env.deposits("topup") == 0
     assert env.value("lido_keys_monitored", **GROUP) == 1
     assert env.value("lido_keys_deposited", **GROUP) == 1
     per_key = dict(GROUP, pubkey=pk, validator_index="")
     assert env.value("lido_keys_deposit_timestamp_seconds", **per_key) == env.chain.timestamp(19_000)
     assert env.value("lido_keys_deposit_credentials_mismatch", **per_key) == 0
+    assert env.value("lido_keys_deposit_initial_eth", **per_key, credentials="0x01") == 32
+    assert env.value("lido_keys_topups", **per_key) is None
     summary = env.store.deposit_summary()[pk]
     assert summary.initial_block == 19_000
     assert summary.credentials_type == "0x01"
@@ -144,8 +149,8 @@ def test_topup_counted_separately(env: Env) -> None:
     env.chain.add_log(19_000, deposit_log(pk, WC))
     env.chain.add_log(19_100, deposit_log(pk, WC, amount_gwei=1_000_000_000))
     env.tick()
-    assert env.value("lido_keys_deposits_total", **GROUP, credentials="0x01") == 1
-    assert env.value("lido_keys_topups_total", **GROUP) == 1
+    assert env.deposits("initial") == 1
+    assert env.deposits("topup") == 1
     assert env.store.deposit_summary()[pk].deposits == 2
     assert env.store.deposit_summary()[pk].initial_block == 19_000
 
@@ -166,9 +171,28 @@ def test_credentials_mismatch(env: Env) -> None:
     assert mismatch(bad) == 1
     assert mismatch(zero) == 1
     assert mismatch(compounding) == 0
-    assert env.value("lido_keys_deposits_total", **GROUP, credentials="0x01") == 2
-    assert env.value("lido_keys_deposits_total", **GROUP, credentials="0x00") == 1
-    assert env.value("lido_keys_deposits_total", **GROUP, credentials="0x02") == 1
+    assert env.deposits("initial") == 4
+
+    def ctype(pk: str, credentials: str) -> Optional[float]:
+        return env.value("lido_keys_deposit_initial_eth", **GROUP, pubkey=pk, validator_index="", credentials=credentials)
+
+    assert ctype(bad, "0x01") == 32
+    assert ctype(zero, "0x00") == 32
+    assert ctype(compounding, "0x02") == 32
+
+
+def test_topup_with_other_credentials_is_no_mismatch(env: Env) -> None:
+    pk = pubkey(1)
+    env.keys[(1, 7)] = [pk]
+    env.chain.add_log(19_000, deposit_log(pk, WC))
+    env.chain.add_log(19_100, deposit_log(pk, credentials(STRANGER), amount_gwei=1_000_000_000))
+    env.tick()
+    per_key = dict(GROUP, pubkey=pk, validator_index="")
+    assert env.value("lido_keys_deposit_credentials_mismatch", **per_key) == 0
+    assert env.store.deposit_summary()[pk].mismatch is False
+    assert env.value("lido_keys_topups", **per_key) == 1
+    assert env.value("lido_keys_topup_eth", **per_key) == 1
+    assert env.value("lido_keys_topup_last_timestamp_seconds", **per_key) == env.chain.timestamp(19_100)
 
 
 def test_expected_credentials_from_config(tmp_path: Path) -> None:
@@ -188,7 +212,7 @@ def test_deposit_before_key_known_matched_on_refresh(env: Env) -> None:
     env.chain.add_log(19_000, deposit_log(pk, WC))
     env.tick()
     assert env.store.deposited_pubkeys() == set()
-    assert env.value("lido_keys_deposits_total", **GROUP, credentials="0x01") is None
+    assert env.deposits("initial") is None  # no monitored keys in the group yet
 
     env.keys[(1, 7)] = [pk]
     env.tick()  # refresh not due yet
@@ -196,7 +220,7 @@ def test_deposit_before_key_known_matched_on_refresh(env: Env) -> None:
     env.refresh_tick()
     assert env.store.deposited_pubkeys() == {pk}
     assert env.store.deposit_summary()[pk].initial_block == 19_000
-    assert env.value("lido_keys_deposits_total", **GROUP, credentials="0x01") == 1
+    assert env.deposits("initial") == 1
 
 
 def test_seeding_marks_prior_deposit_so_later_deposit_is_topup(env: Env) -> None:
@@ -215,8 +239,8 @@ def test_seeding_marks_prior_deposit_so_later_deposit_is_topup(env: Env) -> None
     env.chain.add_log(env.chain.head - 5, deposit_log(old, WC, amount_gwei=5_000_000_000))
     env.chain.add_log(env.chain.head - 5, deposit_log(fresh, WC))
     env.tick()
-    assert env.value("lido_keys_topups_total", **GROUP) == 1
-    assert env.value("lido_keys_deposits_total", **GROUP, credentials="0x01") == 1
+    assert env.deposits("topup") == 1
+    assert env.deposits("initial") == 1
     assert env.value("lido_keys_deposited", **GROUP) == 2
     assert_head_only(env.cl)
 
@@ -337,7 +361,12 @@ def test_triggered_withdrawals_and_source_names(env: Env) -> None:
     assert env.value("lido_keys_triggered_withdrawal_gwei_total", **GROUP, source="ops-wallet") == 1_000_000_000
     assert env.value("lido_keys_triggered_withdrawal_gwei_total", **GROUP, source="lido-withdrawal-vault") is None
     last = env.value(
-        "lido_keys_triggered_withdrawal_last_timestamp_seconds", **GROUP, pubkey=pk2, validator_index="", kind="partial"
+        "lido_keys_triggered_withdrawal_last_timestamp_seconds",
+        **GROUP,
+        pubkey=pk2,
+        validator_index="",
+        kind="partial",
+        source=STRANGER,
     )
     assert last == env.chain.timestamp(19_602)
     calls = env.el.calls_for(WITHDRAWAL_REQUEST_CONTRACT)
@@ -360,12 +389,13 @@ def test_restart_continues_from_cursor(env: Env) -> None:
     env.restart()
     env.tick()
 
-    # Counters restart from zero and only count new events.
-    assert env.value("lido_keys_deposits_total", **GROUP, credentials="0x01") is None
-    assert env.value("lido_keys_topups_total", **GROUP) == 1
-    assert env.value("lido_keys_exit_requests_total", **GROUP) is None
-    assert env.value("lido_keys_triggered_withdrawals_total", **GROUP, kind="exit", source="ops-wallet") is None
+    # Totals come from the store: they survive the restart and include the new events once.
+    assert env.deposits("initial") == 1
+    assert env.deposits("topup") == 1
+    assert env.value("lido_keys_exit_requests_total", **GROUP) == 1
+    assert env.value("lido_keys_triggered_withdrawals_total", **GROUP, kind="exit", source="ops-wallet") == 1
     assert env.value("lido_keys_triggered_withdrawals_total", **GROUP, kind="partial", source="ops-wallet") == 1
+    assert env.value("lido_keys_triggered_withdrawal_gwei_total", **GROUP, source="ops-wallet") == 5
     # Gauges are rebuilt from the store.
     assert env.value("lido_keys_deposited", **GROUP) == 1
     assert env.value("lido_keys_exit_requests_open", **GROUP) == 1
@@ -445,8 +475,8 @@ def test_get_logs_chunk_halving(tmp_path: Path) -> None:
     assert calls[0][2] == env.safe() - LOOKBACK_BLOCKS
     assert calls[-1][3] == env.safe()
     assert all(b[2] == a[3] + 1 for a, b in zip(calls, calls[1:]))
-    assert env.value("lido_keys_deposits_total", **GROUP, credentials="0x01") == 1
-    assert env.value("lido_keys_topups_total", **GROUP) == 1
+    assert env.deposits("initial") == 1
+    assert env.deposits("topup") == 1
 
 
 def test_keys_api_failure_keeps_last_keys(env: Env) -> None:
@@ -538,7 +568,7 @@ def test_reorg_of_cursor_block_does_not_recount(env: Env) -> None:
     env.chain.reorg(env.safe())
     env.chain.mine(1)
     env.tick()
-    assert env.value("lido_keys_deposits_total", **GROUP, credentials="0x01") == 1
+    assert env.deposits("initial") == 1
     assert env.value("lido_keys_triggered_withdrawals_total", **GROUP, kind="exit", source=STRANGER) == 1
     assert env.value("lido_keys_exit_requests_total", **GROUP) == 1
     assert env.store.open_exit_requests() == []
@@ -574,8 +604,8 @@ def test_no_seeding_while_added_keys_unmatched(env: Env, monkeypatch: pytest.Mon
     monkeypatch.setattr(env.store, "raw_deposits_for", real)
     env.cl.next_epoch()
     env.tick()
-    assert env.value("lido_keys_deposits_total", **GROUP, credentials="0x01") == 1
-    assert env.value("lido_keys_topups_total", **GROUP) is None
+    assert env.deposits("initial") == 1
+    assert env.deposits("topup") == 0
 
 
 def test_seeding_reclassifies_topup_of_existing_validator(env: Env) -> None:
@@ -588,10 +618,73 @@ def test_seeding_reclassifies_topup_of_existing_validator(env: Env) -> None:
     info = env.store.validators()[pk]
     assert info.prior_deposit is True and info.index == 11
 
+    assert env.deposits("initial") == 0
+    assert env.deposits("topup") == 1
+
     env.chain.mine(10)
     env.chain.add_log(env.chain.head - 5, deposit_log(pk, WC))
     env.tick()
-    assert env.value("lido_keys_topups_total", **GROUP) == 1
+    assert env.deposits("initial") == 0
+    assert env.deposits("topup") == 2
+    per_key = dict(GROUP, pubkey=pk, validator_index="11")
+    assert env.value("lido_keys_deposit_timestamp_seconds", **per_key) is None
+    assert env.value("lido_keys_topups", **per_key) == 2
+
+
+def test_reclassification_moves_event_to_topup_and_clears_mismatch(env: Env) -> None:
+    pk = pubkey(1)
+    env.keys[(1, 7)] = [pk]
+    env.cl.add_validator(pk, 11, eligibility_epoch=0)
+    env.chain.add_log(19_000, deposit_log(pk, credentials(STRANGER), amount_gwei=2_000_000_000))
+    env.exporter.epoch_work = lambda: None  # type: ignore[method-assign]
+    env.tick()
+    per_key = dict(GROUP, pubkey=pk, validator_index="")
+    assert env.value("lido_keys_deposit_credentials_mismatch", **per_key) == 1
+    assert env.deposits("initial") == 1
+
+    del env.exporter.epoch_work
+    env.tick()
+    per_key["validator_index"] = "11"
+    assert env.value("lido_keys_deposit_credentials_mismatch", **per_key) is None
+    assert env.store.deposit_summary()[pk].mismatch is False
+    # Counters never decrease (a drop would read as a reset): the event stays counted as initial too.
+    assert env.deposits("initial") == 1
+    assert env.deposits("topup") == 1
+    assert env.value("lido_keys_deposit_eth_total", **GROUP, kind="topup") == 2
+    assert env.value("lido_keys_topups", **per_key) == 1
+    assert env.value("lido_keys_deposit_timestamp_seconds", **per_key) is None
+
+    env.chain.mine(10)
+    env.chain.add_log(env.chain.head - 5, deposit_log(pubkey(2), WC))
+    env.keys[(1, 7)] = [pk, pubkey(2)]
+    env.restart()
+    env.tick()
+    env.tick()
+    assert env.deposits("initial") == 2
+    assert env.deposits("topup") == 1
+
+
+def test_totals_survive_restart(env: Env) -> None:
+    pk = pubkey(1)
+    env.keys[(1, 7)] = [pk]
+    env.chain.add_log(19_000, deposit_log(pk, WC))
+    env.chain.add_log(19_001, deposit_log(pk, WC, amount_gwei=1_000_000_000))
+    env.chain.add_log(19_010, exit_request_log(VEBO, 1, 7, 10, pk, 111))
+    env.chain.add_log(19_020, withdrawal_request_log(OPS, pk, 3))
+    env.tick()
+    names = [
+        ("lido_keys_deposit_events_total", dict(GROUP, kind="initial")),
+        ("lido_keys_deposit_events_total", dict(GROUP, kind="topup")),
+        ("lido_keys_deposit_eth_total", dict(GROUP, kind="topup")),
+        ("lido_keys_exit_requests_total", GROUP),
+        ("lido_keys_triggered_withdrawals_total", dict(GROUP, kind="partial", source="ops-wallet")),
+        ("lido_keys_triggered_withdrawal_gwei_total", dict(GROUP, source="ops-wallet")),
+    ]
+    before = [env.value(n, **labels) for n, labels in names]
+    assert before == [1, 1, 1, 1, 1, 3]
+    env.restart()
+    env.tick()
+    assert [env.value(n, **labels) for n, labels in names] == before
 
 
 def test_seeding_keeps_initial_deposit_of_new_validator(env: Env) -> None:
@@ -614,3 +707,22 @@ def test_failed_beacon_lookups_retry_next_tick(env: Env) -> None:
     env.cl.fail = False
     env.tick()  # same epoch, but the failed seeding pass is retried
     assert env.store.validators()[pk].prior_deposit is True
+
+
+def test_exit_request_exported_only_after_beacon_check(env: Env) -> None:
+    pk = pubkey(1)
+    env.keys[(1, 7)] = [pk]
+    env.cl.add_validator(pk, 777)
+    env.cl.set_status(pk, "exited_unslashed")
+    env.chain.add_log(19_000, exit_request_log(VEBO, 1, 7, 777, pk, int(env.chain.timestamp(19_000))))
+    env.exporter.epoch_work = lambda: None  # type: ignore[method-assign]
+    env.tick()
+    per_key = dict(GROUP, pubkey=pk, validator_index="777")
+    assert len(env.store.open_exit_requests()) == 1
+    assert env.value("lido_keys_exit_request_open", **per_key) is None
+    assert env.value("lido_keys_exit_requests_total", **GROUP) == 1
+
+    del env.exporter.epoch_work
+    env.tick()
+    assert env.store.open_exit_requests() == []
+    assert env.value("lido_keys_exit_request_open", **per_key) is None

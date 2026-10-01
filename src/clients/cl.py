@@ -7,7 +7,7 @@ from typing import Any, Callable, Optional
 
 import httpx
 
-from .el import endpoint_name
+from .health import EndpointState, EndpointTracker, HealthResult, endpoint_name
 
 log = logging.getLogger(__name__)
 
@@ -32,15 +32,23 @@ class BeaconClient:
         timeout: float = 30,
         on_error: Optional[Callable[[], None]] = None,
         transport: Optional[httpx.BaseTransport] = None,
+        max_lag: int = 5,
     ) -> None:
         if not endpoints:
             raise ValueError("at least one beacon endpoint is required")
         self.endpoints = [e.rstrip("/") for e in endpoints]
-        self.healthy = list(self.endpoints)
+        self.tracker = EndpointTracker("cl", self.endpoints, max_lag)
         self._on_error = on_error
         self._post_unsupported: set[str] = set()
         self._last_endpoint: Optional[str] = None
         self._http = httpx.Client(timeout=timeout, transport=transport)
+
+    @property
+    def healthy(self) -> list[str]:
+        return self.tracker.up_urls()
+
+    def endpoint_states(self) -> list[EndpointState]:
+        return self.tracker.states()
 
     def _error(self) -> None:
         if self._on_error is not None:
@@ -59,7 +67,7 @@ class BeaconClient:
         if "/states/" in path and not path.startswith(HEAD_STATE_PREFIX):
             raise NonHeadStateError(f"refusing non-head state query: {path}")
         last_exc: Optional[Exception] = None
-        for endpoint in self.healthy or self.endpoints:
+        for endpoint in self.tracker.healthy_urls():
             log.info("beacon request %s %s via %s", method, path, endpoint_name(endpoint))
             try:
                 resp = self._http.request(method, endpoint + path, params=params, json=json)
@@ -70,29 +78,35 @@ class BeaconClient:
                 return resp.status_code, resp.json()
             except (httpx.HTTPError, ValueError) as exc:
                 log.warning("beacon %s %s via %s failed: %s", method, path, endpoint_name(endpoint), exc)
+                reason = "unreachable" if isinstance(exc, httpx.TransportError) else "http_error"
+                self.tracker.record_error(endpoint, reason)
                 self._error()
                 last_exc = exc
         raise CLError(f"{method} {path}: all beacon endpoints failed: {last_exc}")
 
-    def refresh_health(self) -> bool:
-        healthy = []
+    def _health_of(self, endpoint: str) -> HealthResult:
         path = "/eth/v1/node/syncing"
-        for endpoint in self.endpoints:
-            log.info("beacon request GET %s via %s", path, endpoint_name(endpoint))
-            try:
-                resp = self._http.get(endpoint + path)
-                resp.raise_for_status()
-                syncing = resp.json()["data"]["is_syncing"]
-            except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
-                log.warning("beacon endpoint %s unreachable: %s", endpoint_name(endpoint), exc)
-                self._error()
-                continue
-            if syncing is False:
-                healthy.append(endpoint)
-            else:
-                log.warning("beacon endpoint %s not synced", endpoint_name(endpoint))
-        self.healthy = healthy
-        return bool(healthy)
+        log.info("beacon request GET %s via %s", path, endpoint_name(endpoint))
+        try:
+            resp = self._http.get(endpoint + path)
+            resp.raise_for_status()
+            data = resp.json()["data"]
+            syncing = data["is_syncing"] is not False
+            head = int(data["head_slot"]) if data.get("head_slot") is not None else None
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            log.warning("beacon endpoint %s unreachable: %s", endpoint_name(endpoint), exc)
+            self._error()
+            return False, None, None, "http_error" if isinstance(exc, httpx.HTTPStatusError) else "unreachable"
+        if syncing:
+            log.warning("beacon endpoint %s not synced", endpoint_name(endpoint))
+        return True, syncing, head, ""
+
+    def refresh_health(self) -> bool:
+        self.tracker.update_health({endpoint: self._health_of(endpoint) for endpoint in self.endpoints})
+        for state in self.tracker.states():
+            if state.reason == "lagging":
+                log.warning("beacon endpoint %s is %s slots behind", state.endpoint, state.lag)
+        return bool(self.tracker.up_urls())
 
     def head_slot(self) -> int:
         status, body = self._request("GET", "/eth/v1/beacon/headers/head")
@@ -112,7 +126,7 @@ class BeaconClient:
         use_get = False
         while pos < len(ids):
             body = None
-            if not use_get and (self.healthy or self.endpoints)[0] not in self._post_unsupported:
+            if not use_get and self.tracker.healthy_urls()[0] not in self._post_unsupported:
                 batch = ids[pos : pos + POST_BATCH]
                 status, body = self._request(
                     "POST", path, json={"ids": batch}, passthrough=POST_UNSUPPORTED_STATUSES

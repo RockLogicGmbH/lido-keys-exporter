@@ -19,25 +19,27 @@ services:
     image: grafana/grafana:11.6.5
     restart: unless-stopped
     # Grafana does not expand environment variables inside provisioned alert rules, so the
-    # exit request thresholds are rendered into a copy of the provisioning directory.
+    # exit request and endpoint lag thresholds are rendered into a copy of the provisioning directory.
     entrypoint:
       - /bin/sh
       - -ec
       - |
-        for v in "$$LKE_EXIT_WARN_HOURS" "$$LKE_EXIT_CRIT_HOURS"; do
-          case "$$v" in ''|*[!0-9.]*) echo "LKE_EXIT_WARN_HOURS/LKE_EXIT_CRIT_HOURS must be numbers" >&2; exit 1;; esac
+        for v in "$$LKE_EXIT_RESPONSE_HOURS" "$$LKE_EXIT_WARN_HOURS" "$$LKE_EXIT_CRIT_HOURS" "$$LKE_ENDPOINT_LAG"; do
+          case "$$v" in ''|*[!0-9.]*) echo "LKE_EXIT_RESPONSE_HOURS/LKE_EXIT_WARN_HOURS/LKE_EXIT_CRIT_HOURS/LKE_ENDPOINT_LAG must be numbers" >&2; exit 1;; esac
         done
         rm -rf /tmp/provisioning
         cp -r /etc/grafana/provisioning /tmp/provisioning
         mkdir -p /tmp/provisioning/plugins
-        sed -i "s/[$$]{LKE_EXIT_WARN_HOURS}/$$LKE_EXIT_WARN_HOURS/g; s/[$$]{LKE_EXIT_CRIT_HOURS}/$$LKE_EXIT_CRIT_HOURS/g" /tmp/provisioning/alerting/*.yml
+        sed -i "s/[$$]{LKE_EXIT_RESPONSE_HOURS}/$$LKE_EXIT_RESPONSE_HOURS/g; s/[$$]{LKE_EXIT_WARN_HOURS}/$$LKE_EXIT_WARN_HOURS/g; s/[$$]{LKE_EXIT_CRIT_HOURS}/$$LKE_EXIT_CRIT_HOURS/g; s/[$$]{LKE_ENDPOINT_LAG}/$$LKE_ENDPOINT_LAG/g" /tmp/provisioning/alerting/*.yml
         exec /run.sh
     environment:
       GF_PATHS_PROVISIONING: /tmp/provisioning
       GF_SECURITY_ADMIN_USER: ${GF_SECURITY_ADMIN_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:-admin}
+      LKE_EXIT_RESPONSE_HOURS: ${LKE_EXIT_RESPONSE_HOURS:-2}
       LKE_EXIT_WARN_HOURS: ${LKE_EXIT_WARN_HOURS:-48}
       LKE_EXIT_CRIT_HOURS: ${LKE_EXIT_CRIT_HOURS:-84}
+      LKE_ENDPOINT_LAG: ${LKE_ENDPOINT_LAG:-5}
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro

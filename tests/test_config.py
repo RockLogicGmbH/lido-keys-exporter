@@ -44,6 +44,7 @@ def test_defaults(tmp_path):
     assert cfg.triggered_lookback_days == 7
     assert cfg.poll_interval_seconds == 12
     assert cfg.seed_deposited_from_beacon is True
+    assert cfg.max_endpoint_lag == 5
     assert cfg.listen_host == "0.0.0.0"
     assert cfg.listen_port == 9800
     assert cfg.expected_vault_address is None
@@ -86,6 +87,7 @@ def test_expected_credentials_and_sources(tmp_path):
         lambda d: d.update(sets=[]),
         lambda d: d.update(sets=[{"name": "a"}, {"name": "a"}]),
         lambda d: d.update(execution_endpoints=[" "]),
+        lambda d: d.update(max_endpoint_lag=-1),
         lambda d: d["sets"][0]["static_pubkeys"].append({"pubkey": "0x12"}),
     ],
 )
@@ -103,3 +105,9 @@ def test_normalize():
         normalize_pubkey("0x1234")
     with pytest.raises(ValueError):
         normalize_address("0xzz")
+
+
+def test_max_endpoint_lag(tmp_path):
+    data = _base()
+    data["max_endpoint_lag"] = 0
+    assert load_config(_write(tmp_path, data), env={}).max_endpoint_lag == 0

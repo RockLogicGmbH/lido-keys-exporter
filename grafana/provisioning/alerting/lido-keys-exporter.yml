@@ -1,5 +1,6 @@
-# Grafana 11 alert rule provisioning. The ${LKE_EXIT_*_HOURS} placeholders are replaced by the
-# grafana entrypoint in docker-compose.yml (Grafana itself does not expand them here).
+# Grafana 11 alert rule provisioning. The ${LKE_*} placeholders (LKE_EXIT_RESPONSE_HOURS,
+# LKE_EXIT_WARN_HOURS, LKE_EXIT_CRIT_HOURS, LKE_ENDPOINT_LAG) are replaced by the grafana
+# entrypoint in docker-compose.yml (Grafana itself does not expand them here).
 # No contact points or notification policies are provisioned; configure them in Grafana.
 apiVersion: 1
 
@@ -39,7 +40,39 @@ groups:
           severity: critical
         annotations:
           summary: "Deposit with unexpected withdrawal credentials (set {{ $labels.set }})"
-          description: "Validator {{ $labels.pubkey }} (index {{ $labels.validator_index }}) in set {{ $labels.set }} was deposited with withdrawal credentials that do not point to the expected Lido withdrawal vault."
+          description: "Validator {{ $labels.pubkey }} (index {{ $labels.validator_index }}) in set {{ $labels.set }} was deposited (initial deposit) with withdrawal credentials that do not point to the expected Lido withdrawal vault."
+
+      - uid: lke-exit-request-not-handled
+        title: Exit request not handled
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: (time() - lido_keys_exit_request_open) > ${LKE_EXIT_RESPONSE_HOURS} * 3600 and (time() - lido_keys_exit_request_open) <= ${LKE_EXIT_WARN_HOURS} * 3600
+              instant: true
+              range: false
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Exit request not handled after ${LKE_EXIT_RESPONSE_HOURS}h (set {{ $labels.set }}, module {{ $labels.module_id }})"
+          description: "Validator {{ $labels.pubkey }} (index {{ $labels.validator_index }}) in set {{ $labels.set }} (module {{ $labels.module_id }}) was requested to exit {{ humanizeDuration $values.B.Value }} ago and is not exiting yet."
 
       - uid: lke-exit-request-overdue
         title: Exit request overdue
@@ -71,7 +104,7 @@ groups:
           severity: warning
         annotations:
           summary: "Exit request open for more than ${LKE_EXIT_WARN_HOURS}h (set {{ $labels.set }})"
-          description: "Validator {{ $labels.pubkey }} (index {{ $labels.validator_index }}) in set {{ $labels.set }} was requested to exit {{ humanizeDuration $values.B.Value }} ago and is not exiting yet."
+          description: "Validator {{ $labels.pubkey }} (index {{ $labels.validator_index }}) in set {{ $labels.set }} (module {{ $labels.module_id }}) was requested to exit {{ humanizeDuration $values.B.Value }} ago and is not exiting yet."
 
       - uid: lke-exit-request-deadline
         title: Exit request near deadline
@@ -103,19 +136,19 @@ groups:
           severity: critical
         annotations:
           summary: "Exit request open for more than ${LKE_EXIT_CRIT_HOURS}h (set {{ $labels.set }})"
-          description: "Validator {{ $labels.pubkey }} (index {{ $labels.validator_index }}) in set {{ $labels.set }} was requested to exit {{ humanizeDuration $values.B.Value }} ago and is still not exiting. Exit it now."
+          description: "Validator {{ $labels.pubkey }} (index {{ $labels.validator_index }}) in set {{ $labels.set }} (module {{ $labels.module_id }}) was requested to exit {{ humanizeDuration $values.B.Value }} ago and is still not exiting. Exit it now."
 
       - uid: lke-triggered-unexpected-source
         title: Triggered withdrawal from unexpected source
         condition: C
         data:
           - refId: A
-            relativeTimeRange: { from: 3600, to: 0 }
+            relativeTimeRange: { from: 600, to: 0 }
             datasourceUid: prometheus
             model:
               refId: A
-              # "unless ... offset" also catches series created within the hour (counter children start at their first event).
-              expr: sum by (set, module_id, operator_id, kind, source) ((increase(lido_keys_triggered_withdrawals_total{source!~"lido.*"}[1h]) > 0) or (lido_keys_triggered_withdrawals_total{source!~"lido.*"} unless lido_keys_triggered_withdrawals_total{source!~"lido.*"} offset 1h))
+              # Based on the block time of the last request, so lookback history and restarts do not fire it.
+              expr: (time() - lido_keys_triggered_withdrawal_last_timestamp_seconds{source!~"lido.*"}) < 3600
               instant: true
               range: false
           - refId: B
@@ -128,7 +161,7 @@ groups:
               type: threshold
               expression: B
               conditions:
-                - evaluator: { type: gt, params: [0] }
+                - evaluator: { type: lt, params: [3600] }
         noDataState: OK
         execErrState: Error
         for: 0s
@@ -136,18 +169,18 @@ groups:
           severity: critical
         annotations:
           summary: "EIP-7002 {{ $labels.kind }} request from unexpected source {{ $labels.source }}"
-          description: "{{ $values.B.Value }} triggered withdrawal request(s) of kind {{ $labels.kind }} for keys of set {{ $labels.set }} came from {{ $labels.source }} in the last hour."
+          description: "Validator {{ $labels.pubkey }} (index {{ $labels.validator_index }}) in set {{ $labels.set }} got an EIP-7002 {{ $labels.kind }} request from {{ $labels.source }} {{ humanizeDuration $values.B.Value }} ago."
 
       - uid: lke-triggered-exit
         title: Triggered exit for a monitored key
         condition: C
         data:
           - refId: A
-            relativeTimeRange: { from: 3600, to: 0 }
+            relativeTimeRange: { from: 600, to: 0 }
             datasourceUid: prometheus
             model:
               refId: A
-              expr: sum by (set, module_id, operator_id, source) ((increase(lido_keys_triggered_withdrawals_total{kind="exit"}[1h]) > 0) or (lido_keys_triggered_withdrawals_total{kind="exit"} unless lido_keys_triggered_withdrawals_total{kind="exit"} offset 1h))
+              expr: (time() - lido_keys_triggered_withdrawal_last_timestamp_seconds{kind="exit"}) < 3600
               instant: true
               range: false
           - refId: B
@@ -160,15 +193,15 @@ groups:
               type: threshold
               expression: B
               conditions:
-                - evaluator: { type: gt, params: [0] }
+                - evaluator: { type: lt, params: [3600] }
         noDataState: OK
         execErrState: Error
         for: 0s
         labels:
           severity: warning
         annotations:
-          summary: "EIP-7002 triggered exit for a key of set {{ $labels.set }}"
-          description: "{{ $values.B.Value }} triggered exit request(s) from {{ $labels.source }} for keys of set {{ $labels.set }} in the last hour."
+          summary: "EIP-7002 triggered exit for {{ $labels.pubkey }} (set {{ $labels.set }})"
+          description: "Validator {{ $labels.pubkey }} (index {{ $labels.validator_index }}) in set {{ $labels.set }} got an EIP-7002 exit request from {{ $labels.source }} {{ humanizeDuration $values.B.Value }} ago."
 
       - uid: lke-app-stalled
         title: Exporter stalled
@@ -232,7 +265,7 @@ groups:
           severity: critical
         annotations:
           summary: "lido-keys-exporter is down or unhealthy"
-          description: "lido_keys_up is {{ $values.B.Value }} (0 means an endpoint is unhealthy, contract addresses are unresolved or a processing step failed)."
+          description: "lido_keys_up is {{ $values.B.Value }} (0 means no endpoint of a kind is healthy, contract addresses are unresolved or a processing step failed)."
 
       - uid: lke-keyset-stale
         title: Key set stale
@@ -266,6 +299,124 @@ groups:
           summary: "Key set was not refreshed successfully for a while"
           description: "The last successful Keys API refresh was {{ humanizeDuration $values.B.Value }} ago; the last loaded keys are still in use."
 
+      - uid: lke-endpoint-unhealthy
+        title: Data source endpoint unhealthy
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: max by (kind, endpoint) (lido_keys_endpoint_up) == 0
+              instant: true
+              range: false
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: lt, params: [0.5] }
+          - refId: SQ
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: SQ
+              expr: max by (kind, endpoint) (lido_keys_endpoint_syncing)
+              instant: true
+              range: false
+          - refId: S
+            datasourceUid: __expr__
+            model: { refId: S, type: reduce, expression: SQ, reducer: last }
+          - refId: LQ
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: LQ
+              expr: max by (kind, endpoint) (lido_keys_endpoint_lag)
+              instant: true
+              range: false
+          - refId: L
+            datasourceUid: __expr__
+            model: { refId: L, type: reduce, expression: LQ, reducer: last }
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ if eq $labels.kind \"cl\" }}Beacon node{{ else }}Execution node{{ end }} {{ $labels.endpoint }} unhealthy"
+          description: "Endpoint {{ $labels.endpoint }} (kind {{ $labels.kind }}) is not used by the exporter (unreachable, syncing or lagging behind the other endpoints).{{ if $values.S }} Syncing: {{ $values.S.Value }}.{{ end }}{{ if $values.L }} Lag: {{ $values.L.Value }} {{ if eq $labels.kind \"cl\" }}slots{{ else }}blocks{{ end }}.{{ end }}"
+
+      - uid: lke-endpoint-lagging
+        title: Data source endpoint lagging
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: max by (kind, endpoint) (lido_keys_endpoint_lag) > ${LKE_ENDPOINT_LAG}
+              instant: true
+              range: false
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ if eq $labels.kind \"cl\" }}Beacon node{{ else }}Execution node{{ end }} {{ $labels.endpoint }} lagging"
+          description: "Endpoint {{ $labels.endpoint }} (kind {{ $labels.kind }}) is {{ $values.B.Value }} {{ if eq $labels.kind \"cl\" }}slots{{ else }}blocks{{ end }} behind the best endpoint of its kind (threshold ${LKE_ENDPOINT_LAG})."
+
+      - uid: lke-endpoints-all-down
+        title: All data source endpoints of one kind down
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: sum by (kind) (lido_keys_endpoint_up) == 0
+              instant: true
+              range: false
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: lt, params: [0.5] }
+        noDataState: OK
+        execErrState: Error
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ if eq $labels.kind \"cl\" }}All beacon nodes{{ else }}All execution nodes{{ end }} unhealthy"
+          description: "No {{ $labels.kind }} endpoint is healthy; the exporter cannot process new data."
+
       - uid: lke-source-errors
         title: Data source errors
         condition: C
@@ -275,7 +426,7 @@ groups:
             datasourceUid: prometheus
             model:
               refId: A
-              expr: sum by (component) (increase(lido_keys_errors_total[15m]))
+              expr: sum by (kind, endpoint, reason) (increase(lido_keys_endpoint_errors_total{reason!~"range_limit|not_found|unreachable|http_error|syncing|lagging"}[15m])) > 10
               instant: true
               range: false
           - refId: B
@@ -295,5 +446,5 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Many {{ $labels.component }} errors"
-          description: "{{ $values.B.Value }} {{ $labels.component }} errors in the last 15 minutes."
+          summary: "Many {{ $labels.reason }} errors on {{ $labels.kind }} endpoint {{ $labels.endpoint }}"
+          description: "{{ humanize $values.B.Value }} {{ $labels.reason }} errors on {{ $labels.kind }} endpoint {{ $labels.endpoint }} in the last 15 minutes."

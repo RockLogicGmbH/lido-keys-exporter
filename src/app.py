@@ -45,7 +45,6 @@ STREAM_DEPOSITS = "deposits"
 STREAM_EXITS = "exits"
 STREAM_TRIGGERED = "triggered"
 
-Pending = list[Callable[[], None]]
 FAR_FUTURE_EPOCH = 2**64 - 1
 
 
@@ -171,14 +170,11 @@ class Exporter:
     def match_unmatched(self) -> None:
         """Match stored raw deposits against keys that recently joined the key set."""
         pubkeys = sorted(self._unmatched)
-        pending: Pending = []
         with self.store.transaction():
             validators = self.store.validators()
             for dep, ts in self.store.raw_deposits_for(pubkeys):
-                self._match_deposit(dep, ts, validators, pending)
+                self._match_deposit(dep, ts, validators)
         self._unmatched.clear()
-        for fn in pending:
-            fn()
 
     # -- execution layer ---------------------------------------------------
 
@@ -255,7 +251,7 @@ class Exporter:
         topics: list,
         days: float,
         safe: int,
-        handler: Callable[[dict, int, dict[str, ValidatorInfo], Pending], None],
+        handler: Callable[[dict, int, dict[str, ValidatorInfo]], None],
     ) -> None:
         floor = max(0, safe - int(days * BLOCKS_PER_DAY))
         cursor = self.store.get_cursor(stream)
@@ -297,14 +293,11 @@ class Exporter:
             if self.el.get_block(b).hash != header.hash:
                 raise ELError(f"{stream}: block {b} changed while fetching logs, retrying")
 
-            pending: Pending = []
             with self.store.transaction():
                 validators = self.store.validators()
                 for entry, ts in prepared:
-                    handler(entry, ts, validators, pending)
+                    handler(entry, ts, validators)
                 self.store.set_cursor(stream, b, header.hash, header.timestamp)
-            for fn in pending:
-                fn()
             a = b + 1
 
         if stream == STREAM_DEPOSITS:
@@ -318,16 +311,14 @@ class Exporter:
             self.metrics.error("el")
             return None
 
-    def _handle_deposit(self, entry: dict, ts: int, validators: dict[str, ValidatorInfo], pending: Pending) -> None:
+    def _handle_deposit(self, entry: dict, ts: int, validators: dict[str, ValidatorInfo]) -> None:
         dep = self._decode(decode_deposit, entry)
         if dep is None:
             return
         self.store.insert_raw_deposit(dep, ts)
-        self._match_deposit(dep, ts, validators, pending)
+        self._match_deposit(dep, ts, validators)
 
-    def _match_deposit(
-        self, dep: DepositLog, ts: int, validators: dict[str, ValidatorInfo], pending: Pending
-    ) -> None:
+    def _match_deposit(self, dep: DepositLog, ts: int, validators: dict[str, ValidatorInfo]) -> None:
         key = self.keyset.get(dep.pubkey)
         if key is None:
             return
@@ -337,7 +328,10 @@ class Exporter:
             info is not None and info.prior_deposit
         )
         ctype = credentials_type(dep.withdrawal_credentials)
-        mismatch = self.vault is not None and not credentials_match(dep.withdrawal_credentials, self.vault)
+        # The beacon chain ignores the credentials of top-ups.
+        mismatch = (
+            not is_topup and self.vault is not None and not credentials_match(dep.withdrawal_credentials, self.vault)
+        )
         rec = DepositRecord(
             pubkey=dep.pubkey,
             amount_gwei=dep.amount_gwei,
@@ -353,7 +347,6 @@ class Exporter:
         )
         if not self.store.insert_deposit(rec):
             return
-        labels = key.labels()
         if mismatch:
             log.error(
                 "deposit for %s uses unexpected withdrawal credentials %s (tx %s)",
@@ -363,12 +356,10 @@ class Exporter:
             )
         if is_topup:
             log.info("top-up of %d gwei for %s in block %d", dep.amount_gwei, dep.pubkey, ref.block_number)
-            pending.append(lambda: self.metrics.topups.labels(**labels).inc())
         else:
             log.info("deposit for %s in block %d", dep.pubkey, ref.block_number)
-            pending.append(lambda: self.metrics.deposits.labels(**labels, credentials=ctype).inc())
 
-    def _handle_exit(self, entry: dict, ts: int, validators: dict[str, ValidatorInfo], pending: Pending) -> None:
+    def _handle_exit(self, entry: dict, ts: int, validators: dict[str, ValidatorInfo]) -> None:
         ev = self._decode(decode_exit_request, entry)
         if ev is None:
             return
@@ -394,12 +385,8 @@ class Exporter:
         self.store.upsert_validator(ev.pubkey, index=ev.validator_index)
         if inserted:
             log.warning("exit request for %s (validator %d) in block %d", ev.pubkey, ev.validator_index, ref.block_number)
-            labels = key.labels()
-            pending.append(lambda: self.metrics.exit_requests.labels(**labels).inc())
 
-    def _handle_triggered(
-        self, entry: dict, ts: int, validators: dict[str, ValidatorInfo], pending: Pending
-    ) -> None:
+    def _handle_triggered(self, entry: dict, ts: int, validators: dict[str, ValidatorInfo]) -> None:
         req = self._decode(decode_withdrawal_request, entry)
         if req is None:
             return
@@ -426,15 +413,6 @@ class Exporter:
         if not self.store.insert_triggered(rec):
             return
         log.warning("triggered %s withdrawal for %s from %s in block %d", kind, req.pubkey, source, ref.block_number)
-        labels = key.labels()
-        amount = req.amount_gwei
-
-        def count() -> None:
-            self.metrics.triggered.labels(**labels, kind=kind, source=source).inc()
-            if kind == "partial":
-                self.metrics.triggered_gwei.labels(**labels, source=source).inc(amount)
-
-        pending.append(count)
 
     # -- consensus layer ---------------------------------------------------
 
@@ -463,6 +441,8 @@ class Exporter:
         data = self.cl.validators([str(i) for i in sorted(by_index)])
         now = int(self.clock())
         with self.store.transaction():
+            # Only checked requests are exported, so lookback history that was handled long ago never alerts.
+            self.store.mark_exit_requests_checked({rec.pubkey for rec in open_requests}, now)
             for entry in data:
                 status = entry.get("status")
                 if status not in EXITING_STATUSES:

@@ -14,10 +14,10 @@ B = "http://cl-b:5052/"
 PK = ["0x" + f"{i:02x}" * 48 for i in range(3)]
 
 
-def make_client(handler, endpoints=(A, B)):
+def make_client(handler, endpoints=(A, B), max_lag=5):
     errors = []
     client = BeaconClient(
-        list(endpoints), on_error=lambda: errors.append(1), transport=httpx.MockTransport(handler)
+        list(endpoints), on_error=lambda: errors.append(1), transport=httpx.MockTransport(handler), max_lag=max_lag
     )
     return client, errors
 
@@ -109,6 +109,41 @@ def test_refresh_health_none_healthy():
     client, errors = make_client(handler)
     assert client.refresh_health() is False
     assert len(errors) == 1
+    a, b = client.endpoint_states()
+    assert (a.kind, a.endpoint, a.up, a.reason, a.errors) == ("cl", "cl-a:5052", False, "unreachable", {"unreachable": 1})
+    assert (b.up, b.syncing, b.reason, b.errors) == (False, True, "syncing", {"syncing": 1})
+
+
+def test_refresh_health_lagging():
+    heads = {"cl-a": 1000, "cl-b": 1010}
+
+    def handler(request):
+        assert request.url.path == "/eth/v1/node/syncing"
+        return httpx.Response(200, json={"data": {"is_syncing": False, "head_slot": str(heads[request.url.host])}})
+
+    client, errors = make_client(handler)
+    assert client.refresh_health() is True
+    assert client.healthy == ["http://cl-b:5052"]
+    a, b = client.endpoint_states()
+    assert (a.up, a.head, a.lag, a.reason, a.errors) == (False, 1000, 10, "lagging", {"lagging": 1})
+    assert (b.up, b.head, b.lag, b.url) == (True, 1010, 0, "http://cl-b:5052")
+    assert errors == []
+    heads["cl-a"] = 1005
+    client.refresh_health()
+    assert client.healthy == ["http://cl-a:5052", "http://cl-b:5052"]
+
+
+def test_request_error_reasons():
+    def handler(request):
+        if request.url.host == "cl-a":
+            raise httpx.ConnectError("down")
+        return httpx.Response(503)
+
+    client, errors = make_client(handler)
+    with pytest.raises(CLError):
+        client.head_slot()
+    assert [s.errors for s in client.endpoint_states()] == [{"unreachable": 1}, {"http_error": 1}]
+    assert len(errors) == 2
 
 
 def test_validators_post_batches():

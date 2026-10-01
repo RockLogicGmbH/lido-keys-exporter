@@ -77,6 +77,8 @@ class Config(BaseModel):
     poll_interval_seconds: float = Field(default=12, gt=0)
     reorg_rewind_blocks: int = Field(default=64, ge=1)
     http_timeout_seconds: float = Field(default=30, gt=0)
+    # Blocks (EL) / slots (CL) an endpoint may trail the best endpoint of its kind.
+    max_endpoint_lag: int = Field(default=5, ge=0)
     # Full 32 byte credentials or the 20 byte vault address. Resolved from the
     # LidoLocator (withdrawalVault()) when not set.
     expected_withdrawal_credentials: Optional[str] = None

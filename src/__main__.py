@@ -38,8 +38,19 @@ def main(argv: Optional[list[str]] = None) -> None:
     metrics = Metrics()
     metrics.build_info.labels(version=__version__).set(1)
     keys_api = KeysApiClient(timeout=cfg.http_timeout_seconds)
-    el = ExecutionClient(cfg.execution_endpoints, timeout=cfg.http_timeout_seconds, on_error=lambda: metrics.error("el"))
-    cl = BeaconClient(cfg.beacon_endpoints, timeout=cfg.http_timeout_seconds, on_error=lambda: metrics.error("cl"))
+    el = ExecutionClient(
+        cfg.execution_endpoints,
+        timeout=cfg.http_timeout_seconds,
+        on_error=lambda: metrics.error("el"),
+        max_lag=cfg.max_endpoint_lag,
+    )
+    cl = BeaconClient(
+        cfg.beacon_endpoints,
+        timeout=cfg.http_timeout_seconds,
+        on_error=lambda: metrics.error("cl"),
+        max_lag=cfg.max_endpoint_lag,
+    )
+    metrics.register_endpoints(el, cl)
     keyset = KeySet(cfg, fetch=keys_api.fetch, on_error=lambda: metrics.error("keys_api"))
     metrics.register_state(store, keyset)
     start_http_server(cfg.listen_port, addr=cfg.listen_host, registry=metrics.registry)
