@@ -103,13 +103,11 @@ def test_counters_and_static_gauges() -> None:
     m.error("el")
     assert m.registry.get_sample_value("lido_keys_errors_total", {"component": "el"}) == 1
     m.up.set(1)
-    m.keyset_last_refresh.set(123)
     m.build_info.labels(version="1.2.3").set(1)
     get = m.registry.get_sample_value
     for removed in ("lido_keys_deposits", "lido_keys_topups_total", "lido_keys_exit_requests_total"):
         assert removed not in text
     assert get("lido_keys_up") == 1
-    assert get("lido_keys_keyset_last_refresh_timestamp_seconds") == 123
     assert get("lido_keys_build_info", {"version": "1.2.3"}) == 1
 
 
@@ -383,4 +381,67 @@ def test_openmetrics_family_names_unique(tmp_path: Path) -> None:
     store.insert_deposit(deposit(PK1, 110, 1100, topup=True))
     names = [f.name for f in text_string_to_metric_families(om_latest(m.registry).decode())]
     assert len(names) == len(set(names))
+    store.close()
+
+
+def test_keyset_metrics(tmp_path: Path) -> None:
+    cfg = Config.model_validate(
+        {
+            "execution_endpoints": ["http://el"],
+            "beacon_endpoints": ["http://cl"],
+            "sets": [{"name": "main", "keys_api": [{"url": "http://keys-api", "module_id": 1, "operator_id": 7}]}],
+        }
+    )
+    keys: list = []
+
+    def fetch(source):  # type: ignore[no-untyped-def]
+        if not keys:
+            raise RuntimeError("down")
+        return keys
+
+    keyset = KeySet(cfg, fetch=fetch)
+    m = Metrics()
+    m.register_state(Store(tmp_path / "s.sqlite3"), keyset)
+    get = m.registry.get_sample_value
+    text = generate_latest(m.registry).decode()
+    assert "\nlido_keys_keyset_last_refresh_timestamp_seconds " not in text
+    assert get("lido_keys_keyset_loaded") == 0
+    assert get("lido_keys_keyset_refresh_errors_total") == 0
+
+    keyset.refresh()
+    assert get("lido_keys_keyset_last_refresh_timestamp_seconds") is None
+    assert get("lido_keys_keyset_loaded") == 0
+    assert get("lido_keys_keyset_refresh_errors_total") == 1
+
+    keys.append(PK1)
+    keyset.refresh()
+    ts = get("lido_keys_keyset_last_refresh_timestamp_seconds")
+    assert ts and ts > 0
+    assert get("lido_keys_keyset_loaded") == 1
+
+    keys.clear()
+    keyset.refresh()
+    assert get("lido_keys_keyset_last_refresh_timestamp_seconds") == ts
+    assert get("lido_keys_keyset_loaded") == 1
+    assert get("lido_keys_keyset_refresh_errors_total") == 2
+    assert get("lido_keys_monitored", GROUP) == 1
+
+
+def test_counters_hold_while_keyset_incomplete(tmp_path: Path) -> None:
+    store = Store(tmp_path / "s.sqlite3")
+    store.insert_deposit(deposit(PK1, 100, 1000))  # stored without a group, like older versions did
+    m = Metrics()
+    m.register_state(store, make_keyset(), clock=lambda: 10_000)
+    initial = dict(GROUP, kind="initial")
+    assert m.registry.get_sample_value("lido_keys_deposit_events_total", initial) == 1
+
+    cfg = make_keyset()._cfg
+    empty = KeySet(cfg, fetch=lambda source: (_ for _ in ()).throw(RuntimeError("down")))
+    empty.refresh()
+    m2 = Metrics()
+    m2.register_state(store, empty, clock=lambda: 10_000)
+    assert m2.registry.get_sample_value("lido_keys_deposit_events_total", initial) == 1
+    m3 = Metrics()
+    m3.register_state(store, make_keyset(), clock=lambda: 10_000)
+    assert m3.registry.get_sample_value("lido_keys_deposit_events_total", initial) == 1
     store.close()

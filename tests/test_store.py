@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from dataclasses import replace
 
 import pytest
 
@@ -160,14 +161,60 @@ def test_deposit_event_totals(store):
     store.insert_deposit(deposit(pk(1), 30, topup=True, amount=2_000_000_000))
     store.insert_deposit(deposit(pk(2), 25))
     assert store.deposit_event_totals() == {
-        pk(1): {"initial": (1, 32_000_000_000), "topup": (2, 3_000_000_000)},
-        pk(2): {"initial": (1, 32_000_000_000)},
+        (None, pk(1), "initial"): (1, 32_000_000_000),
+        (None, pk(1), "topup"): (2, 3_000_000_000),
+        (None, pk(2), "initial"): (1, 32_000_000_000),
     }
     assert store.deposit_event_totals(since_timestamp=1025) == {
-        pk(1): {"topup": (1, 2_000_000_000)},
-        pk(2): {"initial": (1, 32_000_000_000)},
+        (None, pk(1), "topup"): (1, 2_000_000_000),
+        (None, pk(2), "initial"): (1, 32_000_000_000),
     }
     assert store.deposit_event_totals(since_timestamp=2000) == {}
+
+
+def test_event_totals_by_stored_group(store):
+    group = ("main", "keys_api", 1, 7)
+    static = ("main", "static", None, None)
+    store.insert_deposit(replace(deposit(pk(1), 10), group=group))
+    store.insert_deposit(replace(deposit(pk(2), 11), group=group))
+    store.insert_deposit(replace(deposit(pk(3), 12), group=static))
+    store.insert_deposit(deposit(pk(4), 13))
+    store.insert_triggered(replace(triggered(pk(1), 20), group=group))
+    store.insert_triggered(triggered(pk(4), 21))
+    assert store.deposit_event_totals() == {
+        (group, None, "initial"): (2, 64_000_000_000),
+        (static, None, "initial"): (1, 32_000_000_000),
+        (None, pk(4), "initial"): (1, 32_000_000_000),
+    }
+    assert store.triggered_totals() == {(group, None, "exit", "x"): (1, 0), (None, pk(4), "exit", "x"): (1, 0)}
+    assert store.ungrouped_pubkeys() == {pk(4)}
+
+    assert store.assign_groups({pk(4): group, pk(1): static}) == 2
+    assert store.ungrouped_pubkeys() == set()
+    # Rows that already have a group keep it.
+    assert store.deposit_event_totals() == {
+        (group, None, "initial"): (3, 96_000_000_000),
+        (static, None, "initial"): (1, 32_000_000_000),
+    }
+    assert store.triggered_totals() == {(group, None, "exit", "x"): (2, 0)}
+
+
+def test_group_columns_added_to_old_schema(tmp_path):
+    path = tmp_path / "old.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE deposits (tx_hash TEXT NOT NULL, log_index INTEGER NOT NULL, pubkey TEXT NOT NULL, "
+        "amount_gwei INTEGER NOT NULL, withdrawal_credentials TEXT NOT NULL, credentials_type TEXT NOT NULL, "
+        "mismatch INTEGER NOT NULL, is_topup INTEGER NOT NULL, block_number INTEGER NOT NULL, "
+        "block_hash TEXT NOT NULL, block_timestamp INTEGER NOT NULL, PRIMARY KEY (tx_hash, log_index))"
+    )
+    conn.execute(f"INSERT INTO deposits VALUES ('{tx(1)}', 0, '{pk(1)}', 5, '0x', '0x01', 0, 0, 1, '0x', 1001)")
+    conn.commit()
+    conn.close()
+    s = Store(path)
+    assert s.deposit_event_totals() == {(None, pk(1), "initial"): (1, 5)}
+    assert s.ungrouped_pubkeys() == {pk(1)}
+    s.close()
 
 
 def test_summary_prefers_non_topup(store):
@@ -233,11 +280,14 @@ def test_triggered(store):
         (pk(1), "partial", "y"): 1017,
     }
     assert store.triggered_totals() == {
-        (pk(1), "exit", "x"): (2, 0),
-        (pk(1), "partial", "x"): (1, 5),
-        (pk(1), "partial", "y"): (2, 10),
+        (None, pk(1), "exit", "x"): (2, 0),
+        (None, pk(1), "partial", "x"): (1, 5),
+        (None, pk(1), "partial", "y"): (2, 10),
     }
-    assert store.triggered_totals(since_timestamp=1017) == {(pk(1), "exit", "x"): (1, 0), (pk(1), "partial", "y"): (1, 5)}
+    assert store.triggered_totals(since_timestamp=1017) == {
+        (None, pk(1), "exit", "x"): (1, 0),
+        (None, pk(1), "partial", "y"): (1, 5),
+    }
 
 
 def test_rewind(store):
@@ -323,6 +373,6 @@ def test_reclassification_moves_totals_and_clears_mismatch(store):
     store.insert_deposit(deposit(pk(1), 10, mismatch=True))
     assert store.deposit_summary()[pk(1)].mismatch is True
     assert store.mark_topups_after(pk(1), 1000) == 1
-    assert store.deposit_event_totals() == {pk(1): {"topup": (1, 32_000_000_000)}}
+    assert store.deposit_event_totals() == {(None, pk(1), "topup"): (1, 32_000_000_000)}
     s = store.deposit_summary()[pk(1)]
     assert (s.initial_block, s.mismatch, s.topups) == (None, False, 1)

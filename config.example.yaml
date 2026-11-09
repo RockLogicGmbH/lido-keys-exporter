@@ -31,6 +31,10 @@ confirmations: 2
 # How often the key set is reloaded from the Keys API.
 keyset_refresh_minutes: 10
 
+# Delay before retrying a failed or incomplete key set refresh (also at start, e.g. while the
+# Keys API is still starting). Doubles with every failure up to keyset_refresh_minutes.
+keyset_retry_seconds: 10
+
 # Lookback on first start (and maximum gap after a restart), in days.
 exit_lookback_days: 14
 deposit_lookback_days: 7

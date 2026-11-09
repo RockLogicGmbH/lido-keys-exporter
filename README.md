@@ -38,7 +38,9 @@ Group labels on key metrics: `set`, `origin` (`keys_api` or `static`), `module_i
 | `lido_keys_last_processed_block_timestamp` | gauge | | Timestamp of that block |
 | `lido_keys_last_processed_slot` | gauge | | Slot of that block |
 | `lido_keys_stream_last_processed_block` | gauge | `stream` | Processed block per stream (`deposits`, `exits`, `triggered`) |
-| `lido_keys_keyset_last_refresh_timestamp_seconds` | gauge | | Last fully successful key set refresh |
+| `lido_keys_keyset_last_refresh_timestamp_seconds` | gauge | | Last fully successful key set refresh (no sample until the first one, never 0) |
+| `lido_keys_keyset_loaded` | gauge | | 1 once every Keys API source has been loaded successfully at least once in this process |
+| `lido_keys_keyset_refresh_errors_total` | counter | | Key set refreshes in which at least one Keys API source failed |
 | `lido_keys_endpoint_up` | gauge | `kind`, `endpoint` | 1 if the endpoint is used (reachable, not syncing, not lagging) |
 | `lido_keys_endpoint_syncing` | gauge | `kind`, `endpoint` | 1 if the endpoint reports syncing |
 | `lido_keys_endpoint_head` | gauge | `kind`, `endpoint` | Head block (`el`) or head slot (`cl`), when known |
@@ -50,7 +52,7 @@ Group labels on key metrics: `set`, `origin` (`keys_api` or `static`), `module_i
 
 The `source` label is the name from `known_sources`, `lido-withdrawal-vault` for the Lido withdrawal vault, or the raw address. `kind` on endpoint metrics is `el` (execution) or `cl` (beacon); `endpoint` is `host:port` of the configured URL (scheme, credentials and path are never exported).
 
-Event totals and per-key series are computed from the SQLite store at every scrape, so they survive restarts. The `_total` counters never decrease: when stored totals drop (a deposit reclassified as a top-up, events dropped by a reorg, a key leaving the key set), the drop is added to an offset persisted in the store, because Prometheus would read any decrease as a counter reset and `increase()` would spike. A reclassified deposit therefore stays counted under `initial` and is also counted under `topup`; the gauges (`_24h`, per-key series) show the corrected state. They cover the events seen since the lookback window of the first start; use `increase()` for activity over time (the history found on the first start appears as the initial value, not as an increase). The `_24h` gauges count events whose block time is within the last 24 hours of the exporter clock.
+Event totals and per-key series are computed from the SQLite store at every scrape, so they survive restarts. Deposits and triggered withdrawals are stored with the group of their key, so a key set change (a failed or partial Keys API load, a key that leaves and later rejoins the key set) never moves, drops or recounts them: the deposit and triggered counters only grow with new on-chain events. The `_total` counters never decrease: when stored totals drop (a deposit reclassified as a top-up, events dropped by a reorg), the drop is added to an offset persisted in the store, because Prometheus would read any decrease as a counter reset and `increase()` would spike. While not every Keys API source has loaded yet (`lido_keys_keyset_loaded` 0), a drop is not committed and the last value is exported. A reclassified deposit therefore stays counted under `initial` and is also counted under `topup`; the gauges (`_24h`, per-key series) show the corrected state. They cover the events seen since the lookback window of the first start; use `increase()` for activity over time (the history found on the first start appears as the initial value, not as an increase). The `_24h` gauges count events whose block time is within the last 24 hours of the exporter clock.
 
 ## Configuration
 
@@ -58,7 +60,7 @@ Copy `config.example.yaml` to `config.yaml`; every option is documented there. M
 
 - `execution_endpoints` / `beacon_endpoints`: several endpoints per kind, tried in order; endpoints that are unreachable, report syncing or lag behind are skipped.
 - `max_endpoint_lag` (5): blocks (execution) or slots (beacon) an endpoint may be behind the best endpoint of its kind before it is skipped.
-- `sets`: named key sets. Each set combines Keys API sources (`url`, `module_id`, `operator_id`; read via `GET {url}/v1/modules/{module_id}/keys?used=true&operatorIndex={operator_id}`) and optional static pubkeys with a label. The key set is refreshed every `keyset_refresh_minutes`; if a source fails, its last loaded keys stay in use.
+- `sets`: named key sets. Each set combines Keys API sources (`url`, `module_id`, `operator_id`; read via `GET {url}/v1/modules/{module_id}/keys?used=true&operatorIndex={operator_id}`) and optional static pubkeys with a label. The key set is refreshed every `keyset_refresh_minutes`; if a source fails, its last loaded keys stay in use and the refresh is retried after `keyset_retry_seconds` (10), doubling per failure up to `keyset_refresh_minutes`. The last refresh timestamp only moves on a fully successful refresh.
 - `expected_withdrawal_credentials`: vault address or full credentials. When unset, the Lido withdrawal vault is resolved from the LidoLocator.
 - `known_sources`: names for EIP-7002 request source addresses. Names starting with `lido` are treated as expected by the alert rules.
 - Lookbacks on the first start: `exit_lookback_days` (14), `deposit_lookback_days` (7), `triggered_lookback_days` (7).
@@ -116,13 +118,27 @@ Provisioned automatically in the full stack, in the folder **Lido Keys Exporter*
   | Triggered exit for one of the monitored keys in the last hour (by block time) | warning |
   | Exporter stalled (last processed block older than 5 minutes, for 5m) | critical |
   | Exporter down (`lido_keys_up == 0` or no data, for 5m) | critical |
-  | Key set not refreshed for 30 minutes | warning |
+  | Key set not refreshed for 30 minutes (only once it has loaded: `time() - (lido_keys_keyset_last_refresh_timestamp_seconds > 0) > 1800`) | warning |
+  | Key set not loaded (`lido_keys_keyset_loaded == 0` for 10m, e.g. Keys API unreachable since the start) | warning |
   | Data source endpoint unhealthy (`lido_keys_endpoint_up == 0` for 5m, names the beacon or execution node) | warning |
   | Data source endpoint lagging more than `LKE_ENDPOINT_LAG` (5) blocks / slots for 5m | warning |
   | All data source endpoints of one kind down for 2m | critical |
   | More than 10 request errors in 15 minutes per endpoint and reason (`rpc_error`; `range_limit` and `not_found` are handled, and `unreachable`, `http_error`, `syncing`, `lagging` are counted at every health check and covered by the endpoint rules) | warning |
 
   Grafana does not expand environment variables in provisioned alert rules, so the Grafana entrypoint in `docker-compose.yml` renders `LKE_EXIT_RESPONSE_HOURS`, `LKE_EXIT_WARN_HOURS`, `LKE_EXIT_CRIT_HOURS` and `LKE_ENDPOINT_LAG` into a copy of the provisioning directory. No contact points or notification policies are provisioned; configure them in Grafana. The colour thresholds of the open exit requests table are fixed at 2h, 48h and 84h.
+
+### Alerts in another Grafana
+
+Rules kept outside this repository should follow the same patterns:
+
+- Key set stale: guard the timestamp, `time() - (lido_keys_keyset_last_refresh_timestamp_seconds > 0) > 1800`, and alert on `lido_keys_keyset_loaded == 0` (for 10m) separately. Failing refreshes: `increase(lido_keys_keyset_refresh_errors_total[30m]) > 0`.
+- New deposits: base them on block time, not on counter increases, so restarts and counter offsets cannot fire them. Per key: `count by (set, module_id, operator_id) ((time() - lido_keys_deposit_timestamp_seconds) < 3600)` for initial deposits and the same with `lido_keys_topup_last_timestamp_seconds` for top-ups; per group: `sum by (set, kind) (lido_keys_deposit_events_24h) > 0`.
+
+## Upgrading from 0.1.1
+
+- The `deposits` and `triggered` tables get the columns `set_name`, `origin`, `module_id` and `operator_id` on start. Rows stored by older versions get them once their key is in the key set; until then they are attributed through the current key set as before.
+- `lido_keys_keyset_last_refresh_timestamp_seconds` has no sample until the first successful refresh (it was 0). Update the key set stale rule and add the key set not loaded rule from `grafana/provisioning/alerting`.
+- Counter offsets persisted by older versions are kept, so a counter that was already raised by a key set reload stays at its value (it never decreases).
 
 ## Upgrading from 0.1.0
 

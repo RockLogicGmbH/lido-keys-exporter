@@ -58,6 +58,7 @@ class KeySet:
         self._last_good: dict[tuple[int, int], list[str]] = {}
         self._warned_duplicates: set[str] = set()
         self.last_success_timestamp: Optional[float] = None
+        self.failed_refreshes = 0
 
     def sources(self) -> list[tuple[str, KeysApiSource]]:
         return [(s.name, src) for s in self._cfg.sets for src in s.keys_api]
@@ -109,6 +110,8 @@ class KeySet:
             ok = errors == 0
             if ok:
                 self.last_success_timestamp = time.time()
+            else:
+                self.failed_refreshes += 1
         log.info("key set refreshed: %d keys (+%d -%d), %d errors", len(keys), len(added), len(removed), errors)
         return RefreshResult(ok=ok, added=added, removed=removed, errors=errors)
 

@@ -726,3 +726,136 @@ def test_exit_request_exported_only_after_beacon_check(env: Env) -> None:
     env.tick()
     assert env.store.open_exit_requests() == []
     assert env.value("lido_keys_exit_request_open", **per_key) is None
+
+
+def test_startup_without_keys_api(env: Env) -> None:
+    """Restart while the Keys API is unreachable for 30 s (the 09.11.2026 incident)."""
+    pk, other = pubkey(1), pubkey(2)
+    env.keys[(1, 7)] = [pk, other]
+    env.chain.add_log(19_000, deposit_log(pk, WC))
+    env.chain.add_log(19_001, deposit_log(other, WC))
+    env.chain.add_log(19_600, withdrawal_request_log(OPS, pk, 0))
+    env.tick()
+    assert env.deposits("initial") == 2
+    assert env.value("lido_keys_deposit_eth_total", **GROUP, kind="initial") == 64
+    triggered = dict(GROUP, kind="exit", source="ops-wallet")
+    assert env.value("lido_keys_triggered_withdrawals_total", **triggered) == 1
+
+    env.restart()
+    env.keys[(1, 7)] = RuntimeError("connection refused")  # type: ignore[assignment]
+    start = env.now
+    env.chain.mine(5)
+    env.chain.add_log(env.chain.head - 3, withdrawal_request_log(OPS, other, 0))
+    loaded_at = None
+    for _ in range(10):
+        if env.now - start >= 30:
+            env.keys[(1, 7)] = [pk, other]
+        env.tick()
+        # Never 0 (that read as 20766 days), no sample until the first success.
+        assert env.value("lido_keys_keyset_last_refresh_timestamp_seconds") != 0
+        assert env.deposits("initial") == 2
+        assert env.value("lido_keys_deposit_eth_total", **GROUP, kind="initial") == 64
+        if loaded_at is None and env.value("lido_keys_keyset_loaded") == 1:
+            loaded_at = env.now
+        if loaded_at is None:
+            assert env.value("lido_keys_keyset_last_refresh_timestamp_seconds") is None
+            assert env.value("lido_keys_triggered_withdrawals_total", **triggered) == 1
+    assert loaded_at is not None and loaded_at - start < 60
+    assert env.value("lido_keys_keyset_refresh_errors_total") >= 2
+    assert env.value("lido_keys_keyset_last_refresh_timestamp_seconds")
+    assert env.store.get_cursor("triggered").block_number == env.safe()
+    assert env.value("lido_keys_triggered_withdrawals_total", **triggered) == 2
+    assert env.deposits("initial") == 2
+
+
+def test_keyset_retry_backoff(env: Env) -> None:
+    env.keys[(1, 7)] = RuntimeError("down")  # type: ignore[assignment]
+    attempts: list[float] = []
+    refresh = env.keyset.refresh
+
+    def counting_refresh():  # type: ignore[no-untyped-def]
+        attempts.append(env.now)
+        return refresh()
+
+    env.keyset.refresh = counting_refresh  # type: ignore[method-assign]
+    for _ in range(400):
+        env.tick(advance=1)
+    gaps = [b - a for a, b in zip(attempts, attempts[1:])]
+    assert gaps[:5] == [10, 20, 40, 80, 160]
+
+    # Capped at the normal interval.
+    for _ in range(3000):
+        env.tick(advance=1)
+    assert max(b - a for a, b in zip(attempts, attempts[1:])) == env.cfg.keyset_refresh_minutes * 60
+
+    # Back to the normal interval after a success, and a later failure starts over at the first delay.
+    env.keys[(1, 7)] = [pubkey(1)]
+    env.tick(advance=600)
+    succeeded = env.value("lido_keys_keyset_last_refresh_timestamp_seconds")
+    assert succeeded
+    attempts.clear()
+    env.keys[(1, 7)] = RuntimeError("down")  # type: ignore[assignment]
+    for _ in range(700):
+        env.tick(advance=1)
+    assert [b - a for a, b in zip(attempts, attempts[1:])][:1] == [10]
+    assert env.value("lido_keys_keyset_last_refresh_timestamp_seconds") == succeeded
+    assert env.value("lido_keys_monitored", **GROUP) == 1
+
+
+def test_keyset_changes_do_not_recount_deposits(env: Env) -> None:
+    pk, other = pubkey(1), pubkey(2)
+    env.keys[(1, 7)] = [pk, other]
+    env.chain.add_log(19_000, deposit_log(pk, WC))
+    env.chain.add_log(19_001, deposit_log(other, WC, amount_gwei=1_000_000_000))
+    env.tick()
+    assert env.deposits("initial") == 2
+    assert env.deposits("topup") == 0
+
+    # A successful refresh drops a key, a later one adds it again: its deposit stays counted once.
+    env.keys[(1, 7)] = [other]
+    env.refresh_tick()
+    assert env.deposits("initial") == 2
+    env.keys[(1, 7)] = [pk, other]
+    env.refresh_tick()
+    env.tick()
+    assert env.deposits("initial") == 2
+    assert env.value("lido_keys_deposit_eth_total", **GROUP, kind="initial") == 33
+
+    # Only a new on-chain deposit moves the counter.
+    env.chain.mine(5)
+    env.chain.add_log(env.chain.head - 3, deposit_log(pubkey(3), WC))
+    env.keys[(1, 7)] = [pk, other, pubkey(3)]
+    env.refresh_tick()
+    env.tick()
+    assert env.deposits("initial") == 3
+
+
+def test_events_of_older_versions_get_their_group(env: Env) -> None:
+    pk = pubkey(1)
+    env.keys[(1, 7)] = [pk]
+    env.chain.add_log(19_000, deposit_log(pk, WC))
+    env.chain.add_log(19_600, withdrawal_request_log(OPS, pk, 0))
+    env.tick()
+    triggered = dict(GROUP, kind="exit", source="ops-wallet")
+    assert env.deposits("initial") == 1  # scraped before the upgrade
+    for table in ("deposits", "triggered"):
+        env.store._execute(f"UPDATE {table} SET set_name = NULL, origin = NULL, module_id = NULL, operator_id = NULL")
+    assert env.store.ungrouped_pubkeys() == {pk}
+
+    # Restart of an upgraded exporter while the Keys API is down: the old rows cannot be attributed yet.
+    env.restart()
+    env.keys[(1, 7)] = RuntimeError("down")  # type: ignore[assignment]
+    env.tick()
+    assert env.value("lido_keys_keyset_loaded") == 0
+    assert env.deposits("initial") == 1
+    assert env.value("lido_keys_triggered_withdrawals_total", **triggered) == 1
+
+    env.keys[(1, 7)] = [pk]
+    env.tick()
+    assert env.value("lido_keys_keyset_loaded") == 1
+    assert env.store.ungrouped_pubkeys() == set()
+    assert env.deposits("initial") == 1
+    assert env.value("lido_keys_triggered_withdrawals_total", **triggered) == 1
+    env.keys[(1, 7)] = []
+    env.refresh_tick()
+    assert env.deposits("initial") == 1

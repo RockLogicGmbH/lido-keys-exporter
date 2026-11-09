@@ -70,6 +70,8 @@ class Config(BaseModel):
     beacon_endpoints: list[str]
     confirmations: int = Field(default=2, ge=0)
     keyset_refresh_minutes: float = Field(default=10, gt=0)
+    # First retry delay after a failed key set refresh; doubles per failure up to keyset_refresh_minutes.
+    keyset_retry_seconds: float = Field(default=10, gt=0)
     exit_lookback_days: float = Field(default=14, ge=0)
     deposit_lookback_days: float = Field(default=7, ge=0)
     triggered_lookback_days: float = Field(default=7, ge=0)
