@@ -37,13 +37,9 @@ class Metrics:
         for component in ERROR_COMPONENTS:
             self.errors.labels(component=component)
         self.up = Gauge("lido_keys_up", "1 if the last iteration fully succeeded", registry=r)
-        self.keyset_last_refresh = Gauge(
-            "lido_keys_keyset_last_refresh_timestamp_seconds",
-            "Time of the last fully successful key set refresh",
-            registry=r,
-        )
         self.build_info = Gauge("lido_keys_build_info", "Build information", ("version",), registry=r)
         self._state: Optional[StateCollector] = None
+        self._keyset: Optional[KeySetCollector] = None
         self._endpoints: Optional[EndpointCollector] = None
 
     def error(self, component: str) -> None:
@@ -52,8 +48,11 @@ class Metrics:
     def register_state(
         self, store: "Store", keyset: "KeySet", clock: Callable[[], float] = time.time
     ) -> "StateCollector":
-        if self._state is not None:
-            self.registry.unregister(self._state)
+        for old in (self._state, self._keyset):
+            if old is not None:
+                self.registry.unregister(old)
+        self._keyset = KeySetCollector(keyset)
+        self.registry.register(self._keyset)
         self._state = StateCollector(store, keyset, clock)
         self.registry.register(self._state)
         return self._state
@@ -75,9 +74,37 @@ def _opt(value: Optional[int]) -> str:
     return "" if value is None else str(value)
 
 
+class KeySetCollector(Collector):
+    """Key set state. The refresh timestamp has no sample until the first fully successful refresh."""
+
+    def __init__(self, keyset: "KeySet"):
+        self.keyset = keyset
+
+    def describe(self) -> list:
+        return []
+
+    def collect(self) -> Iterator[Metric]:
+        last = GaugeMetricFamily(
+            "lido_keys_keyset_last_refresh_timestamp_seconds", "Time of the last fully successful key set refresh"
+        )
+        if self.keyset.last_success_timestamp is not None:
+            last.add_metric([], self.keyset.last_success_timestamp)
+        yield last
+        yield GaugeMetricFamily(
+            "lido_keys_keyset_loaded",
+            "1 once every Keys API source has been loaded successfully at least once",
+            value=1 if self.keyset.all_sources_loaded() else 0,
+        )
+        yield CounterMetricFamily(
+            "lido_keys_keyset_refresh_errors",
+            "Key set refreshes in which at least one Keys API source failed",
+            value=self.keyset.failed_refreshes,
+        )
+
+
 class _MonotonicTotals:
-    """Turns store totals, which drop on reclassification, reorgs or key set changes, into counters that never
-    decrease: every drop is added to a persisted offset."""
+    """Turns store totals, which drop on reclassification or reorgs, into counters that never decrease: every drop
+    is added to a persisted offset. With hold, a drop is not committed and the last value is exported instead."""
 
     def __init__(self, store: "Store"):
         self.store = store
@@ -94,11 +121,13 @@ class _MonotonicTotals:
         prefix = name + "\x1f"
         return [k.split("\x1f")[1:] for k in sorted(self._load()) if k.startswith(prefix)]
 
-    def value(self, name: str, labels: list[str], raw: float) -> float:
+    def value(self, name: str, labels: list[str], raw: float, hold: bool = False) -> float:
         self._offsets = self._load()
         series = "\x1f".join([name, *labels])
         last, offset = self._offsets.get(series, (raw, 0.0))
         if raw < last - 1e-9:
+            if hold:
+                return last + offset
             offset += last - raw
         if (raw, offset) != self._offsets.get(series):
             self._offsets[series] = self._changed[series] = (raw, offset)
@@ -123,6 +152,7 @@ class StateCollector(Collector):
         self._lock = threading.Lock()
         self._totals = _MonotonicTotals(store)
         self._emitted: set[tuple[str, tuple[str, ...]]] = set()
+        self._hold = False
 
     def describe(self) -> list:
         return []
@@ -140,10 +170,13 @@ class StateCollector(Collector):
 
     def _counter(self, family: CounterMetricFamily, labels: list[str], raw: float) -> None:
         self._emitted.add((family.name, tuple(labels)))
-        family.add_metric(labels, self._totals.value(family.name, labels, raw))
+        family.add_metric(labels, self._totals.value(family.name, labels, raw, hold=self._hold))
 
     def _build(self) -> list[Metric]:
         self._emitted = set()
+        # Rows stored by older versions have no key group and are attributed through the key set; until every
+        # source has loaded, a drop is a missing key set rather than gone events and must not be made permanent.
+        self._hold = not self.keyset.all_sources_loaded()
         since = int(self.clock()) - DAY
         keys = self.keyset.all()
         validators = self.store.validators()
@@ -156,11 +189,18 @@ class StateCollector(Collector):
             key = keys.get(pubkey)
             return tuple(_group_values(key.labels())) if key is not None else None
 
+        def event_group(stored: Optional[tuple], pubkey: Optional[str]) -> Optional[tuple[str, ...]]:
+            """The group an event was stored under, else (older rows) the current group of its key."""
+            if stored is not None:
+                set_name, origin, module_id, operator_id = stored
+                return (set_name, origin, _opt(module_id), _opt(operator_id))
+            return group_of(pubkey) if pubkey is not None else None
+
         families: list[Metric] = []
         groups: set[tuple[str, ...]] = set()
-        families += self._keys_and_deposits(keys, validators, vindex, groups, since)
+        families += self._keys_and_deposits(keys, validators, vindex, event_group, groups, since)
         families += self._exit_requests(vindex, groups, since)
-        families += self._triggered(group_of, vindex, since)
+        families += self._triggered(group_of, event_group, vindex, since)
         families += self._cursors()
         # A series whose rows are gone (reorg, key set change) keeps its last value instead of vanishing.
         for family in families:
@@ -170,7 +210,7 @@ class StateCollector(Collector):
                         self._counter(family, labels, 0)
         return families
 
-    def _keys_and_deposits(self, keys, validators, vindex, groups: set, since: int) -> list[Metric]:
+    def _keys_and_deposits(self, keys, validators, vindex, event_group, groups: set, since: int) -> list[Metric]:
         summary = self.store.deposit_summary()
         totals = self.store.deposit_event_totals()
         recent = self.store.deposit_event_totals(since)
@@ -207,10 +247,21 @@ class StateCollector(Collector):
             "lido_keys_topup_last_timestamp_seconds", "Block time of the latest top-up per key", labels=PER_KEY
         )
 
-        n_monitored: TallyCounter = TallyCounter()
-        n_deposited: TallyCounter = TallyCounter()
+        # Event totals follow the group stored with each event, so key set changes never move or drop them.
         all_time: dict[tuple, list[int]] = {}
         window: dict[tuple, list[int]] = {}
+        for source, target in ((totals, all_time), (recent, window)):
+            for (stored, pk, kind), (count, gwei) in source.items():
+                group = event_group(stored, pk)
+                if group is None:
+                    continue
+                groups.add(group)
+                acc = target.setdefault(group + (kind,), [0, 0])
+                acc[0] += count
+                acc[1] += gwei
+
+        n_monitored: TallyCounter = TallyCounter()
+        n_deposited: TallyCounter = TallyCounter()
         for pubkey, key in keys.items():
             group = tuple(_group_values(key.labels()))
             groups.add(group)
@@ -219,11 +270,6 @@ class StateCollector(Collector):
             dep = summary.get(pubkey)
             if dep is not None or (info is not None and info.prior_deposit):
                 n_deposited[group] += 1
-            for source, target in ((totals, all_time), (recent, window)):
-                for kind, (count, gwei) in source.get(pubkey, {}).items():
-                    acc = target.setdefault(group + (kind,), [0, 0])
-                    acc[0] += count
-                    acc[1] += gwei
             if dep is None:
                 continue
             values = list(group) + [pubkey, vindex(pubkey)]
@@ -239,6 +285,7 @@ class StateCollector(Collector):
         for group in sorted(n_monitored):
             monitored.add_metric(list(group), n_monitored[group])
             deposited.add_metric(list(group), n_deposited.get(group, 0))
+        for group in sorted(groups):
             for kind in DEPOSIT_KINDS:
                 count, gwei = all_time.get(group + (kind,), (0, 0))
                 self._counter(events_total, list(group) + [kind], count)
@@ -297,17 +344,17 @@ class StateCollector(Collector):
             exits_open.add_metric(list(group), n)
         return [requests_total, requests_24h, exit_open, exits_open]
 
-    def _triggered(self, group_of, vindex, since: int) -> list[Metric]:
+    def _triggered(self, group_of, event_group, vindex, since: int) -> list[Metric]:
         totals: dict[tuple, list[int]] = {}
-        for (pubkey, kind, source), (count, gwei) in self.store.triggered_totals().items():
-            group = group_of(pubkey)
+        for (stored, pubkey, kind, source), (count, gwei) in self.store.triggered_totals().items():
+            group = event_group(stored, pubkey)
             if group is not None:
                 acc = totals.setdefault(group + (kind, source), [0, 0])
                 acc[0] += count
                 acc[1] += gwei
         recent: TallyCounter = TallyCounter()
-        for (pubkey, kind, source), (count, _gwei) in self.store.triggered_totals(since).items():
-            group = group_of(pubkey)
+        for (stored, pubkey, kind, source), (count, _gwei) in self.store.triggered_totals(since).items():
+            group = event_group(stored, pubkey)
             if group is not None:
                 recent[group + (kind, source)] += count
 

@@ -82,6 +82,7 @@ class Exporter:
         self.vault: Optional[str] = None
         self.safe_head: Optional[int] = None
         self._next_refresh: Optional[float] = None
+        self._retry_delay: Optional[float] = None
         self._exits_epoch: Optional[int] = None
         self._seed_epoch: Optional[int] = None
         self._seed_pending = False
@@ -129,9 +130,10 @@ class Exporter:
 
         now = self.clock()
         if self._next_refresh is None or now >= self._next_refresh:
-            self._next_refresh = now + self.cfg.keyset_refresh_minutes * 60
-            if step("keys_api", self.refresh_keyset) is False:
+            refreshed = step("keys_api", self.refresh_keyset)
+            if refreshed is False:
                 ok = False
+            self._schedule_refresh(now, refreshed is True)
         elif not self.addresses_resolved:
             self.resolve_addresses()
         if self._unmatched and self.vault is not None:
@@ -150,10 +152,21 @@ class Exporter:
 
     # -- key set -----------------------------------------------------------
 
+    def _schedule_refresh(self, now: float, ok: bool) -> None:
+        """Normal interval after a successful refresh, else retry with a doubling delay up to that interval."""
+        interval = self.cfg.keyset_refresh_minutes * 60
+        if ok:
+            self._retry_delay = None
+            delay = interval
+        else:
+            base = self.cfg.keyset_retry_seconds
+            self._retry_delay = base if self._retry_delay is None else self._retry_delay * 2
+            delay = min(self._retry_delay, interval)
+            log.info("key set refresh incomplete, retrying in %.0f s", delay)
+        self._next_refresh = now + delay
+
     def refresh_keyset(self) -> bool:
         result = self.keyset.refresh()
-        if self.keyset.last_success_timestamp is not None:
-            self.metrics.keyset_last_refresh.set(self.keyset.last_success_timestamp)
         log.info(
             "key set refreshed: %d keys, %d added, %d removed, %d errors",
             len(self.keyset),
@@ -164,8 +177,21 @@ class Exporter:
         self._unmatched |= set(result.added)
         self._unmatched -= set(result.removed)
         self._seed_pending = True
+        self._assign_groups()
         self.resolve_addresses()
         return result.ok
+
+    def _assign_groups(self) -> None:
+        """Pin events stored by older versions (without a key group) to the group of their key."""
+        pending = self.store.ungrouped_pubkeys()
+        if not pending:
+            return
+        keys = self.keyset.all()
+        groups = {
+            pk: (key.set_name, key.origin, key.module_id, key.operator_id) for pk, key in keys.items() if pk in pending
+        }
+        if groups:
+            log.info("stored the key group of %d older event(s)", self.store.assign_groups(groups))
 
     def match_unmatched(self) -> None:
         """Match stored raw deposits against keys that recently joined the key set."""
@@ -344,6 +370,7 @@ class Exporter:
             block_timestamp=ts,
             tx_hash=ref.tx_hash,
             log_index=ref.log_index,
+            group=(key.set_name, key.origin, key.module_id, key.operator_id),
         )
         if not self.store.insert_deposit(rec):
             return
@@ -409,6 +436,7 @@ class Exporter:
             slot=slot_at(ts),
             tx_hash=ref.tx_hash,
             log_index=ref.log_index,
+            group=(key.set_name, key.origin, key.module_id, key.operator_id),
         )
         if not self.store.insert_triggered(rec):
             return

@@ -276,7 +276,8 @@ groups:
             datasourceUid: prometheus
             model:
               refId: A
-              expr: time() - lido_keys_keyset_last_refresh_timestamp_seconds
+              # No sample before the first successful refresh; that case is the "Key set not loaded" rule.
+              expr: time() - (lido_keys_keyset_last_refresh_timestamp_seconds > 0)
               instant: true
               range: false
           - refId: B
@@ -298,6 +299,38 @@ groups:
         annotations:
           summary: "Key set was not refreshed successfully for a while"
           description: "The last successful Keys API refresh was {{ humanizeDuration $values.B.Value }} ago; the last loaded keys are still in use."
+
+      - uid: lke-keyset-not-loaded
+        title: Key set not loaded
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: lido_keys_keyset_loaded
+              instant: true
+              range: false
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: lt, params: [0.5] }
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Key set not loaded"
+          description: "Not every Keys API source has been loaded since the exporter started; keys of the missing sources are not monitored and triggered withdrawals are not scanned yet."
 
       - uid: lke-endpoint-unhealthy
         title: Data source endpoint unhealthy

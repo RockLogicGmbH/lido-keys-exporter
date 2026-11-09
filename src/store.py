@@ -48,6 +48,10 @@ CREATE TABLE IF NOT EXISTS deposits (
     block_number INTEGER NOT NULL,
     block_hash TEXT NOT NULL,
     block_timestamp INTEGER NOT NULL,
+    set_name TEXT,
+    origin TEXT,
+    module_id INTEGER,
+    operator_id INTEGER,
     PRIMARY KEY (tx_hash, log_index)
 );
 CREATE INDEX IF NOT EXISTS deposits_pubkey ON deposits (pubkey);
@@ -90,6 +94,10 @@ CREATE TABLE IF NOT EXISTS triggered (
     block_hash TEXT NOT NULL,
     block_timestamp INTEGER NOT NULL,
     slot INTEGER NOT NULL,
+    set_name TEXT,
+    origin TEXT,
+    module_id INTEGER,
+    operator_id INTEGER,
     PRIMARY KEY (tx_hash, log_index)
 );
 CREATE INDEX IF NOT EXISTS triggered_timestamp ON triggered (block_timestamp);
@@ -101,6 +109,12 @@ CREATE TABLE IF NOT EXISTS counter_offsets (
 """
 
 EVENT_TABLES = ("raw_deposits", "deposits", "exit_requests", "triggered")
+# Tables whose rows carry the key group they were counted under (NULL for rows stored by older versions).
+GROUPED_TABLES = ("deposits", "triggered")
+GROUP_COLUMNS = (("set_name", "TEXT"), ("origin", "TEXT"), ("module_id", "INTEGER"), ("operator_id", "INTEGER"))
+
+# (set_name, origin, module_id, operator_id)
+Group = tuple[str, str, Optional[int], Optional[int]]
 
 
 @dataclass(frozen=True)
@@ -124,6 +138,7 @@ class DepositRecord:
     block_timestamp: int
     tx_hash: str
     log_index: int
+    group: Optional[Group] = None
 
 
 @dataclass(frozen=True)
@@ -159,6 +174,7 @@ class TriggeredRecord:
     slot: int
     tx_hash: str
     log_index: int
+    group: Optional[Group] = None
 
 
 @dataclass(frozen=True)
@@ -211,6 +227,11 @@ class Store:
         columns = {r[1] for r in self._conn.execute("PRAGMA table_info(exit_requests)")}
         if "checked_at" not in columns:
             self._conn.execute("ALTER TABLE exit_requests ADD COLUMN checked_at INTEGER")
+        for table in GROUPED_TABLES:
+            columns = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+            for name, sql_type in GROUP_COLUMNS:
+                if name not in columns:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
         # Top-ups ignore credentials on the beacon chain; 0.1.0 flagged them too.
         self._conn.execute("UPDATE deposits SET mismatch = 0 WHERE is_topup = 1 AND mismatch = 1")
         if self._conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 0:
@@ -313,8 +334,8 @@ class Store:
     def insert_deposit(self, rec: DepositRecord) -> bool:
         cur = self._execute(
             "INSERT OR IGNORE INTO deposits (tx_hash, log_index, pubkey, amount_gwei, withdrawal_credentials, "
-            "credentials_type, mismatch, is_topup, block_number, block_hash, block_timestamp) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "credentials_type, mismatch, is_topup, block_number, block_hash, block_timestamp, set_name, origin, "
+            "module_id, operator_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 rec.tx_hash,
                 rec.log_index,
@@ -327,6 +348,7 @@ class Store:
                 rec.block_number,
                 rec.block_hash,
                 rec.block_timestamp,
+                *(rec.group or (None, None, None, None)),
             ),
         )
         return cur.rowcount == 1
@@ -370,17 +392,15 @@ class Store:
                 result[pubkey] = replace(prev, deposits=prev.deposits + 1)
         return result
 
-    def deposit_event_totals(self, since_timestamp: Optional[int] = None) -> dict[str, dict[str, tuple[int, int]]]:
-        """Pubkey -> kind ('initial'|'topup') -> (count, gwei), optionally only events at or after since."""
-        sql = "SELECT pubkey, is_topup, COUNT(*), SUM(amount_gwei) FROM deposits"
-        params: tuple = ()
-        if since_timestamp is not None:
-            sql += " WHERE block_timestamp >= ?"
-            params = (since_timestamp,)
-        result: dict[str, dict[str, tuple[int, int]]] = {}
-        for pubkey, topup, count, gwei in self._query(sql + " GROUP BY pubkey, is_topup", params):
-            result.setdefault(pubkey, {})["topup" if topup else "initial"] = (count, gwei or 0)
-        return result
+    def deposit_event_totals(
+        self, since_timestamp: Optional[int] = None
+    ) -> dict[tuple[Optional[Group], Optional[str], str], tuple[int, int]]:
+        """(group, pubkey, kind) -> (count, gwei), optionally only events at or after since.
+
+        Rows with a stored group are summed per group (pubkey None); rows without one per pubkey (group None)."""
+        kind = "CASE WHEN is_topup THEN 'topup' ELSE 'initial' END"
+        rows = self._grouped_totals("deposits", (kind,), since_timestamp)
+        return {(group, pubkey, kind): totals for group, pubkey, (kind,), totals in rows}
 
     def deposited_pubkeys(self) -> set[str]:
         return {r[0] for r in self._query("SELECT DISTINCT pubkey FROM deposits")}
@@ -499,7 +519,8 @@ class Store:
     def insert_triggered(self, rec: TriggeredRecord) -> bool:
         cur = self._execute(
             "INSERT OR IGNORE INTO triggered (tx_hash, log_index, pubkey, kind, amount_gwei, source_address, "
-            "source_name, block_number, block_hash, block_timestamp, slot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "source_name, block_number, block_hash, block_timestamp, slot, set_name, origin, module_id, operator_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 rec.tx_hash,
                 rec.log_index,
@@ -512,6 +533,7 @@ class Store:
                 rec.block_hash,
                 rec.block_timestamp,
                 rec.slot,
+                *(rec.group or (None, None, None, None)),
             ),
         )
         return cur.rowcount == 1
@@ -523,15 +545,58 @@ class Store:
         )
         return {(p, k, src): ts for p, k, src, ts in rows}
 
-    def triggered_totals(self, since_timestamp: Optional[int] = None) -> dict[tuple[str, str, str], tuple[int, int]]:
-        """(pubkey, kind, source_name) -> (count, gwei), optionally only requests at or after since."""
-        sql = "SELECT pubkey, kind, source_name, COUNT(*), SUM(amount_gwei) FROM triggered"
+    def triggered_totals(
+        self, since_timestamp: Optional[int] = None
+    ) -> dict[tuple[Optional[Group], Optional[str], str, str], tuple[int, int]]:
+        """(group, pubkey, kind, source_name) -> (count, gwei), optionally only requests at or after since.
+
+        Rows with a stored group are summed per group (pubkey None); rows without one per pubkey (group None)."""
+        rows = self._grouped_totals("triggered", ("kind", "source_name"), since_timestamp)
+        return {(group, pubkey, kind, source): totals for group, pubkey, (kind, source), totals in rows}
+
+    # Key groups of stored events
+
+    def _grouped_totals(
+        self, table: str, extra: tuple[str, ...], since_timestamp: Optional[int]
+    ) -> list[tuple[Optional[Group], Optional[str], tuple, tuple[int, int]]]:
+        sql = (
+            "SELECT set_name, origin, module_id, operator_id, CASE WHEN set_name IS NULL THEN pubkey END, "
+            f"{', '.join(extra)}, COUNT(*), SUM(amount_gwei) FROM {table}"
+        )
         params: tuple = ()
         if since_timestamp is not None:
             sql += " WHERE block_timestamp >= ?"
             params = (since_timestamp,)
-        rows = self._query(sql + " GROUP BY pubkey, kind, source_name", params)
-        return {(p, k, src): (n, gwei or 0) for p, k, src, n, gwei in rows}
+        n_extra = len(extra)
+        group_by = ", ".join(str(i) for i in range(1, 6 + n_extra))
+        result = []
+        for row in self._query(f"{sql} GROUP BY {group_by}", params):
+            set_name, origin, module_id, operator_id, pubkey = row[:5]
+            group = None if set_name is None else (set_name, origin, module_id, operator_id)
+            count, gwei = row[5 + n_extra :]
+            result.append((group, pubkey, tuple(row[5 : 5 + n_extra]), (count, gwei or 0)))
+        return result
+
+    def ungrouped_pubkeys(self) -> set[str]:
+        """Pubkeys with deposits or triggered requests stored without a key group."""
+        out: set[str] = set()
+        for table in GROUPED_TABLES:
+            out.update(r[0] for r in self._query(f"SELECT DISTINCT pubkey FROM {table} WHERE set_name IS NULL"))
+        return out
+
+    def assign_groups(self, groups: dict[str, Group]) -> int:
+        """Store the key group of events that have none yet, so later key set changes cannot move them."""
+        changed = 0
+        with self.transaction():
+            for pubkey, group in sorted(groups.items()):
+                for table in GROUPED_TABLES:
+                    cur = self._conn.execute(
+                        f"UPDATE {table} SET set_name = ?, origin = ?, module_id = ?, operator_id = ? "
+                        "WHERE pubkey = ? AND set_name IS NULL",
+                        (*group, pubkey),
+                    )
+                    changed += cur.rowcount
+        return changed
 
     # Counter offsets
 
